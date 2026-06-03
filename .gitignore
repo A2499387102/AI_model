@@ -1,0 +1,28 @@
+# 模型文件
+saved_models/
+
+# 生成的报告和临时数据
+reports/
+reports_*/
+*.csv
+
+# Jupyter 临时文件
+.ipynb_checkpoints/
+_demo_test.py
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# 环境
+.env
+*.egg-info/
+dist/
+build/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
