@@ -33,7 +33,7 @@ class Binning:
 
             sub = sub.copy()
             sub["_bin"] = pd.cut(sub[col], bins=edges, include_lowest=True)
-            grp = sub.groupby("_bin", observed=True)[target].agg(["sum", "count"])
+            grp = sub.groupby("_bin")[target].agg(["sum", "count"])
             grp.columns = ["坏样本数", "总样本数"]
             grp["好样本数"] = grp["总样本数"] - grp["坏样本数"]
             grp["坏样本占比"] = (grp["坏样本数"] / total_bad).clip(lower=1e-6)

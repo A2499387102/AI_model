@@ -14,11 +14,15 @@ class FeatureSelector:
         psi_threshold: float = 0.5,
         missing_threshold: float = 0.98,
         corr_threshold: float = 0.97,
+        psi_filter: bool = True,
+        corr_filter: bool = True,
     ):
         self.iv_threshold = iv_threshold
         self.psi_threshold = psi_threshold
         self.missing_threshold = missing_threshold
         self.corr_threshold = corr_threshold
+        self.psi_filter = psi_filter    # False：PSI 只计算展示，不做剔除
+        self.corr_filter = corr_filter  # False：相关性只计算展示，不做剔除
         self.report_df: pd.DataFrame = pd.DataFrame()
         self.selected_cols: list = []
         self.dropped_cols: list = []
@@ -67,7 +71,7 @@ class FeatureSelector:
             reasons = []
             if miss >= self.missing_threshold:
                 reasons.append(f"缺失率={miss:.3f}>={self.missing_threshold}")
-            if not np.isnan(psi) and psi >= self.psi_threshold:
+            if self.psi_filter and not np.isnan(psi) and psi >= self.psi_threshold:
                 reasons.append(f"PSI={psi:.3f}>={self.psi_threshold}")
             if np.isnan(iv) or iv < self.iv_threshold:
                 reasons.append(f"IV={iv if not np.isnan(iv) else 'N/A'}<{self.iv_threshold}")
@@ -86,25 +90,26 @@ class FeatureSelector:
             if r["_reasons"]:
                 drop_set.add(r["特征名"])
 
-        surviving = [r["特征名"] for r in rows if r["特征名"] not in drop_set]
-        for i, col_a in enumerate(surviving):
-            if col_a in drop_set:
-                continue
-            for col_b in surviving[i + 1:]:
-                if col_b in drop_set:
+        if self.corr_filter:
+            surviving = [r["特征名"] for r in rows if r["特征名"] not in drop_set]
+            for i, col_a in enumerate(surviving):
+                if col_a in drop_set:
                     continue
-                if col_a not in corr_matrix.index or col_b not in corr_matrix.columns:
-                    continue
-                c = corr_matrix.loc[col_a, col_b]
-                if c >= self.corr_threshold:
-                    iv_a = iv_df.loc[col_a, "IV"] if col_a in iv_df.index else 0
-                    iv_b = iv_df.loc[col_b, "IV"] if col_b in iv_df.index else 0
-                    dropped = col_b if iv_a >= iv_b else col_a
-                    kept = col_a if dropped == col_b else col_b
-                    drop_set.add(dropped)
-                    for r in rows:
-                        if r["特征名"] == dropped:
-                            r["_reasons"].append(f"与{kept}相关系数={c:.3f}>={self.corr_threshold}")
+                for col_b in surviving[i + 1:]:
+                    if col_b in drop_set:
+                        continue
+                    if col_a not in corr_matrix.index or col_b not in corr_matrix.columns:
+                        continue
+                    c = corr_matrix.loc[col_a, col_b]
+                    if c >= self.corr_threshold:
+                        iv_a = iv_df.loc[col_a, "IV"] if col_a in iv_df.index else 0
+                        iv_b = iv_df.loc[col_b, "IV"] if col_b in iv_df.index else 0
+                        dropped = col_b if iv_a >= iv_b else col_a
+                        kept = col_a if dropped == col_b else col_b
+                        drop_set.add(dropped)
+                        for r in rows:
+                            if r["特征名"] == dropped:
+                                r["_reasons"].append(f"与{kept}相关系数={c:.3f}>={self.corr_threshold}")
 
         for r in rows:
             r["是否保留"] = "保留" if not r["_reasons"] else "剔除"

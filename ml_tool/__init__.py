@@ -4,6 +4,7 @@ from .feature_selection import FeatureSelector
 from .model_train import ModelTrainer
 from .report import ReportGenerator
 from .model_eval import evaluate_by_group, evaluate_clf_by_group, evaluate_reg_by_group
+from .data_split import split_dataset
 
 __all__ = [
     "FeatureAnalyzer",
@@ -14,4 +15,5 @@ __all__ = [
     "evaluate_by_group",
     "evaluate_clf_by_group",
     "evaluate_reg_by_group",
+    "split_dataset",
 ]

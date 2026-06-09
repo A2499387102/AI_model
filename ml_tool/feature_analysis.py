@@ -95,7 +95,12 @@ class FeatureAnalyzer:
                         "特征B": cols[j],
                         "相关系数": round(val, 4),
                     })
-        return pd.DataFrame(rows).sort_values("相关系数", ascending=False, key=abs) if rows else pd.DataFrame(columns=["特征A", "特征B", "相关系数"])
+        if not rows:
+            return pd.DataFrame(columns=["特征A", "特征B", "相关系数"])
+        df = pd.DataFrame(rows)
+        df["_abs"] = df["相关系数"].abs()
+        df = df.sort_values("_abs", ascending=False).drop(columns=["_abs"]).reset_index(drop=True)
+        return df
 
     def full_analysis(
         self,
@@ -113,3 +118,58 @@ class FeatureAnalyzer:
         if base_df is not None and compare_df is not None:
             result["PSI"] = self.psi(base_df, compare_df, bins=psi_bins)
         return result
+
+    def by_group_analysis(
+        self,
+        group_col: str,
+        raw_df: pd.DataFrame,
+    ) -> dict:
+        """
+        按 group_col（如 dataset / month）分组，分别计算缺失率、一值率、分位数。
+
+        参数
+        ----
+        group_col : 分组列名（如 'dataset' 或 'month'），须包含在 raw_df 中
+        raw_df    : 包含特征列 + group_col 的原始 DataFrame
+
+        返回
+        ----
+        {
+          "缺失率":   长格式 DataFrame，列 [group_col, 特征名, 缺失数, 缺失率]
+          "一值率":   长格式 DataFrame，列 [group_col, 特征名, 最高频值, 一值率]
+          "分位数统计": 长格式 DataFrame，列 [group_col, 特征名, 均值, ...]
+        }
+        """
+        if group_col not in raw_df.columns:
+            raise ValueError(f"group_col '{group_col}' 不在 raw_df 中")
+
+        missing_rows, single_rows, quantile_rows = [], [], []
+
+        for gval, gdf in raw_df.groupby(group_col, sort=True):
+            feat_df = gdf[self.num_cols + self.cat_cols].reset_index(drop=True)
+            sub = FeatureAnalyzer(feat_df, cat_cols=self.cat_cols)
+
+            # 缺失率
+            mr = sub.missing_rate()
+            mr.insert(0, group_col, gval)
+            missing_rows.append(mr)
+
+            # 一值率
+            sr = sub.single_value_rate()
+            sr.insert(0, group_col, gval)
+            single_rows.append(sr)
+
+            # 分位数（仅数值型）
+            qr = sub.quantile_stats()
+            if not qr.empty:
+                qr.insert(0, group_col, gval)
+                quantile_rows.append(qr)
+
+        def _concat(rows):
+            return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+        return {
+            "缺失率":   _concat(missing_rows),
+            "一值率":   _concat(single_rows),
+            "分位数统计": _concat(quantile_rows),
+        }
