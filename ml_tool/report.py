@@ -77,6 +77,162 @@ def _build_feature_importance_df(feature_importance) -> Optional[pd.DataFrame]:
     return fi[["排名", "特征名", "重要性得分", "占比(%)", "累计占比(%)"]]
 
 
+def _write_feature_binplot_sheet(
+    writer,
+    raw_df: "pd.DataFrame",
+    target_col: str,
+    feature_importance,
+    n_top: int = 20,
+    n_bins: int = 5,
+) -> None:
+    """
+    在 ExcelWriter 中生成 "特征箱线图" sheet。
+
+    - 取特征重要性前 n_top 个特征（降序，不足则取全部）
+    - 每个特征占一行，一行三张图对应 train / test / oot
+    - 每张图：x 轴 = 等频 5 分箱区间，y 轴 = 箱内 target_col 均值，柱状图
+    - 分箱切点统一用训练集计算，三集合共用
+    - 每张图约 300×220 px，x 轴标签旋转 45 度
+    - 图表标题："{feature} - {dataset名}"
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.font_manager as _fm
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.utils import get_column_letter
+
+    # 中文字体
+    _cn_font = None
+    for _fn in ["Microsoft YaHei", "SimHei", "Noto Sans SC", "SimSun"]:
+        if any(f.name == _fn for f in _fm.fontManager.ttflist):
+            _cn_font = _fn
+            break
+    if _cn_font:
+        plt.rcParams["font.family"] = _cn_font
+    plt.rcParams["axes.unicode_minus"] = False
+
+    DATASET_ORDER = [
+        ("train", "训练集"),
+        ("test",  "验证集"),
+        ("oot",   "OOT"),
+    ]
+
+    # 解析特征重要性，取前 n_top
+    fi_df = _build_feature_importance_df(feature_importance)
+    if fi_df is None:
+        return
+    top_features = fi_df["特征名"].tolist()[:n_top]
+    if not top_features:
+        return
+
+    # 创建 sheet
+    workbook = writer.book
+    sheet_name = "特征箱线图"
+    if sheet_name in workbook.sheetnames:
+        ws = workbook[sheet_name]
+    else:
+        ws = workbook.create_sheet(title=sheet_name)
+
+    # 图片尺寸（像素 → EMU，openpyxl 用 EMU；1 px ≈ 9525 EMU at 96 dpi）
+    IMG_W_PX = 300
+    IMG_H_PX = 220
+    # Cell column widths / row heights are in Excel units; approximate pixel mapping:
+    # col width 1 unit ≈ 7 px, row height 1 unit ≈ 0.75 px
+    IMG_W_PX = 300
+    IMG_H_PX = 220
+    COL_W    = IMG_W_PX / 7
+    ROW_H    = IMG_H_PX / 0.75
+
+    # 训练集，用于计算分箱切点
+    train_df = raw_df[raw_df["dataset"] == "train"]
+
+    # 每个特征一行，第1列写特征名，图从第2列起（三张图对应 train/test/oot）
+    NAME_COL  = 1
+    IMG_START = 2
+    NAME_COL    = 1
+    IMG_START   = 2
+
+    # 训练集，用于计算分箱切点
+    train_df = raw_df[raw_df["dataset"] == "train"]
+
+    for row_idx, feature in enumerate(top_features):
+        if feature not in raw_df.columns:
+            continue
+
+        train_vals = train_df[feature].dropna()
+        if train_vals.empty:
+            continue
+        try:
+            quantiles = np.linspace(0, 100, n_bins + 1)
+            cut_edges = np.unique(np.percentile(train_vals, quantiles))
+            if len(cut_edges) < 2:
+                continue
+            cut_edges[0]  = -np.inf
+            cut_edges[-1] =  np.inf
+        except Exception:
+            continue
+
+        excel_row = row_idx + 1
+        # 第1列写特征名
+        ws.cell(row=excel_row, column=NAME_COL, value=feature)
+        ws.row_dimensions[excel_row].height = ROW_H
+        ws.column_dimensions[get_column_letter(NAME_COL)].width = 15
+
+        for col_idx, (ds_key, ds_label) in enumerate(DATASET_ORDER):
+            sub = raw_df[raw_df["dataset"] == ds_key]
+            if sub.empty or feature not in sub.columns or target_col not in sub.columns:
+                continue
+
+            sub = sub[[feature, target_col]].dropna()
+            if sub.empty:
+                continue
+
+            try:
+                bins_series = pd.cut(
+                    sub[feature],
+                    bins=cut_edges,
+                    include_lowest=True,
+                    duplicates="drop",
+                )
+            except Exception:
+                continue
+
+            agg = (
+                sub.groupby(bins_series, observed=True)[target_col]
+                .mean()
+                .reset_index()
+            )
+            agg.columns = ["bin", "mean_target"]
+            agg["bin_str"] = agg["bin"].astype(str)
+
+            # 绘图，标题只写 dataset 名
+            fig, ax = plt.subplots(figsize=(IMG_W_PX / 96, IMG_H_PX / 96))
+            ax.bar(range(len(agg)), agg["mean_target"], color="#4C72B0", edgecolor="white")
+            ax.set_xticks(range(len(agg)))
+            ax.set_xticklabels(agg["bin_str"], rotation=45, ha="right", fontsize=7)
+            ax.set_title(ds_label, fontsize=8, pad=4)
+            ax.tick_params(axis="y", labelsize=7)
+            ax.set_ylabel("均值", fontsize=7)
+            plt.tight_layout()
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=96)
+            plt.close(fig)
+            buf.seek(0)
+
+            img = XLImage(buf)
+            img.width  = IMG_W_PX
+            img.height = IMG_H_PX
+
+            excel_col   = IMG_START + col_idx
+            col_letter  = get_column_letter(excel_col)
+            ws.column_dimensions[col_letter].width = COL_W
+            cell_addr = f"{col_letter}{excel_row}"
+            ws.add_image(img, cell_addr)
+
+
 def _make_bin_labels(mins: list, maxs: list) -> list:
     """根据每箱的实际最小值/最大值生成首尾相连的区间标签。
     相邻箱边界对齐：第 i 箱右端 = 第 i+1 箱左端（取两者边界的均值）。
@@ -98,8 +254,25 @@ def _make_bin_labels(mins: list, maxs: list) -> list:
     return labels
 
 
+def _edges_to_bin_labels(edges: list) -> list:
+    """把切点边界列表直接转成区间标签，首尾相连。
+    edges: [e0, e1, e2, ..., en]，生成 n 个区间。
+    首区间用 [ 左闭，其余用 ( 左开，所有右端用 ] 右闭。
+    ±inf 显示为实际边界值（跳过无穷）。
+    """
+    labels = []
+    for i in range(len(edges) - 1):
+        l = edges[i]
+        r = edges[i + 1]
+        lp = "[" if i == 0 else "("
+        l_str = str(round(l, 4)) if not np.isinf(l) else str(round(r - abs(r) * 0.01, 4))
+        r_str = str(round(r, 4)) if not np.isinf(r) else str(round(l + abs(l) * 0.01, 4))
+        labels.append(f"{lp}{l_str}, {r_str}]")
+    return labels
+
+
 def _decile_table(y_true, y_score, weights=None, n_bins: int = 10) -> pd.DataFrame:
-    """按预测分数等频分箱，统计每箱坏样本率、样本占比、Lift"""
+    """按预测分数等频分箱，统计每箱坏样本率、Lift、累计Lift（高→低 和 低→高）"""
     total_n = len(y_true)
     total_bad = int(np.array(y_true).sum())
     overall_bad_rate = total_bad / total_n if total_n > 0 else 1e-6
@@ -130,10 +303,28 @@ def _decile_table(y_true, y_score, weights=None, n_bins: int = 10) -> pd.DataFra
         })
     if not rows:
         return pd.DataFrame(columns=["分箱", "分箱区间", "样本数", "样本占比", "坏样本数",
-                                     "加权样本数", "最低分", "最高分", "坏样本率", "Lift"])
+                                     "加权样本数", "最低分", "最高分", "坏样本率", "Lift",
+                                     "累计Lift(高→低)", "累计Lift(低→高)"])
     grp = pd.DataFrame(rows)
     grp.insert(1, "分箱区间", _make_bin_labels(
         grp["最低分"].tolist(), grp["最高分"].tolist()))
+
+    # 累计Lift（高→低）：按分数从高到低累计，即从最后一箱往前累计
+    cum_bad_hl  = grp["坏样本数"].iloc[::-1].cumsum().iloc[::-1].values
+    cum_n_hl    = grp["样本数"].iloc[::-1].cumsum().iloc[::-1].values
+    grp["累计Lift(高→低)"] = [
+        round((cb / cn) / overall_bad_rate, 4) if cn > 0 else None
+        for cb, cn in zip(cum_bad_hl, cum_n_hl)
+    ]
+
+    # 累计Lift（低→高）：按分数从低到高累计，即从第一箱往后累计
+    cum_bad_lh = grp["坏样本数"].cumsum().values
+    cum_n_lh   = grp["样本数"].cumsum().values
+    grp["累计Lift(低→高)"] = [
+        round((cb / cn) / overall_bad_rate, 4) if cn > 0 else None
+        for cb, cn in zip(cum_bad_lh, cum_n_lh)
+    ]
+
     return grp
 
 
@@ -220,54 +411,278 @@ def _build_cross_matrix(y_true, y_pred, true_edges: list, pred_edges: list,
 
     true_bins = sorted(df["真实桶"].dropna().unique())
     pred_bins = sorted(df["预测桶"].dropna().unique())
-    col_label = "真实值桶\\预测值桶"
-    pred_cols  = [f"预测桶{int(pb)}" for pb in pred_bins]
+    col_label = "真实值区间\\预测值区间"
 
-    mape_rows, count_rows, label_rows = [], [], []
+    # 从 edges 生成区间标签，按桶编号（1-based）索引
+    true_labels_all = _edges_to_bin_labels(true_edges)
+    pred_labels_all = _edges_to_bin_labels(pred_edges)
+    true_label_map  = {i + 1: lbl for i, lbl in enumerate(true_labels_all)}
+    pred_label_map  = {i + 1: lbl for i, lbl in enumerate(pred_labels_all)}
+
+    pred_cols = [pred_label_map.get(int(pb), f"预测桶{int(pb)}") for pb in pred_bins]
+
+    mape_rows, count_n_rows, count_r_rows, label_rows = [], [], [], []
     for tb in true_bins:
-        sub_t  = df[df["真实桶"] == tb]
-        mrow   = {col_label: f"真实桶{int(tb)}"}
-        crow   = {col_label: f"真实桶{int(tb)}"}
-        lrow   = {col_label: f"真实桶{int(tb)}"}
+        sub_t    = df[df["真实桶"] == tb]
+        row_name = true_label_map.get(int(tb), f"真实桶{int(tb)}")
+        mrow  = {col_label: row_name}
+        nrow  = {col_label: row_name}
+        rrow  = {col_label: row_name}
+        lrow  = {col_label: row_name}
         for pb, pc in zip(pred_bins, pred_cols):
             sub = sub_t[sub_t["预测桶"] == pb]
             n   = len(sub)
             mrow[pc] = round(_mape(sub["真实值"].values, sub["预测值"].values), 2) if n else None
-            crow[pc] = f"{n}({round(100*n/total_n,1)}%)" if n else "0(0.0%)"
+            nrow[pc] = n
+            rrow[pc] = round(n / total_n, 4) if n else 0
             if labels is not None:
                 lrow[pc] = _label_rate(sub["_label"].values)
         rt = len(sub_t)
         mrow["合计"] = round(_mape(sub_t["真实值"].values, sub_t["预测值"].values), 2) if rt else None
-        crow["合计"] = f"{rt}({round(100*rt/total_n,1)}%)"
+        nrow["合计"] = rt
+        rrow["合计"] = round(rt / total_n, 4)
         if labels is not None:
             lrow["合计"] = _label_rate(sub_t["_label"].values)
         mape_rows.append(mrow)
-        count_rows.append(crow)
+        count_n_rows.append(nrow)
+        count_r_rows.append(rrow)
         if labels is not None:
             label_rows.append(lrow)
 
     # 列合计行
-    mrow_total  = {col_label: "合计"}
-    crow_total  = {col_label: "合计"}
-    lrow_total  = {col_label: "合计"}
+    mrow_total = {col_label: "合计"}
+    nrow_total = {col_label: "合计"}
+    rrow_total = {col_label: "合计"}
+    lrow_total = {col_label: "合计"}
     for pb, pc in zip(pred_bins, pred_cols):
         sub_p = df[df["预测桶"] == pb]
         np_   = len(sub_p)
         mrow_total[pc] = round(_mape(sub_p["真实值"].values, sub_p["预测值"].values), 2) if np_ else None
-        crow_total[pc] = f"{np_}({round(100*np_/total_n,1)}%)"
+        nrow_total[pc] = np_
+        rrow_total[pc] = round(np_ / total_n, 4)
         if labels is not None:
             lrow_total[pc] = _label_rate(sub_p["_label"].values)
     mrow_total["合计"] = round(_mape(df["真实值"].values, df["预测值"].values), 2)
-    crow_total["合计"] = f"{total_n}(100.0%)"
+    nrow_total["合计"] = total_n
+    rrow_total["合计"] = 1.0
     if labels is not None:
         lrow_total["合计"] = _label_rate(df["_label"].values)
     mape_rows.append(mrow_total)
-    count_rows.append(crow_total)
+    count_n_rows.append(nrow_total)
+    count_r_rows.append(rrow_total)
     if labels is not None:
         label_rows.append(lrow_total)
 
     label_df = pd.DataFrame(label_rows) if labels is not None else None
-    return pd.DataFrame(mape_rows), pd.DataFrame(count_rows), label_df
+    return pd.DataFrame(mape_rows), pd.DataFrame(count_n_rows), pd.DataFrame(count_r_rows), label_df
+
+
+def _build_gain_matrix(y_label, y_pred, score, n_bins: int = 10):
+    """score × 模型预测分 交叉矩阵（各自独立等频分箱）。
+
+    返回 (n_df, ratio_df, bad_rate_df)：
+      n_df:        格子样本数（整数）
+      ratio_df:    格子样本占比（小数）
+      bad_rate_df: 格子坏账率 = 逾期1样本数 / (0+1样本总和)
+    行 = score 分箱，列 = 模型预测分分箱，末行/末列为合计。
+    """
+    total_n = len(y_label)
+    df = pd.DataFrame({
+        "label": np.array(y_label),
+        "pred":  np.array(y_pred),
+        "score": np.array(score),
+    })
+
+    # 各自独立等频分箱
+    try:
+        df["score_bin"] = pd.qcut(df["score"], q=n_bins, duplicates="drop", labels=False).astype("Int64") + 1
+    except Exception:
+        df["score_bin"] = 1
+    try:
+        df["pred_bin"]  = pd.qcut(df["pred"],  q=n_bins, duplicates="drop", labels=False).astype("Int64") + 1
+    except Exception:
+        df["pred_bin"] = 1
+
+    score_bins = sorted(df["score_bin"].dropna().unique())
+    pred_bins  = sorted(df["pred_bin"].dropna().unique())
+
+    # 生成列标签（用实际分数区间）
+    def _qcut_labels(series, bins):
+        try:
+            _, edges = pd.qcut(series.dropna(), q=bins, duplicates="drop", retbins=True)
+            edges[0] = series.min(); edges[-1] = series.max()
+            return _make_bin_labels(
+                [edges[i] for i in range(len(edges)-1)],
+                [edges[i+1] for i in range(len(edges)-1)]
+            )
+        except Exception:
+            return [str(b) for b in range(1, bins+1)]
+
+    score_lbls = _qcut_labels(df["score"], n_bins)
+    pred_lbls  = _qcut_labels(df["pred"],  n_bins)
+    score_lmap = {b: score_lbls[i] for i, b in enumerate(score_bins)}
+    pred_lmap  = {b: pred_lbls[i]  for i, b in enumerate(pred_bins)}
+    pred_cols  = [pred_lmap.get(int(pb), str(pb)) for pb in pred_bins]
+    col_label  = "score分箱\\预测分箱"
+
+    n_rows, r_rows, br_rows = [], [], []
+    for sb in score_bins:
+        sub_s  = df[df["score_bin"] == sb]
+        rname  = score_lmap.get(int(sb), str(sb))
+        nrow   = {col_label: rname}
+        rrow   = {col_label: rname}
+        brrow  = {col_label: rname}
+        for pb, pc in zip(pred_bins, pred_cols):
+            sub = sub_s[sub_s["pred_bin"] == pb]
+            n   = len(sub)
+            nrow[pc]  = n
+            rrow[pc]  = round(n / total_n, 4) if n else 0
+            brrow[pc] = _label_rate(sub["label"].values)
+        st = len(sub_s)
+        nrow["合计"]  = st
+        rrow["合计"]  = round(st / total_n, 4)
+        brrow["合计"] = _label_rate(sub_s["label"].values)
+        n_rows.append(nrow); r_rows.append(rrow); br_rows.append(brrow)
+
+    # 列合计行
+    nt = {col_label: "合计"}; rt_ = {col_label: "合计"}; brt = {col_label: "合计"}
+    for pb, pc in zip(pred_bins, pred_cols):
+        sub_p = df[df["pred_bin"] == pb]
+        np_   = len(sub_p)
+        nt[pc]  = np_
+        rt_[pc] = round(np_ / total_n, 4)
+        brt[pc] = _label_rate(sub_p["label"].values)
+    nt["合计"]  = total_n
+    rt_["合计"] = 1.0
+    brt["合计"] = _label_rate(df["label"].values)
+    n_rows.append(nt); r_rows.append(rt_); br_rows.append(brt)
+
+    return pd.DataFrame(n_rows), pd.DataFrame(r_rows), pd.DataFrame(br_rows)
+
+
+def _scorecard_table(score, label, n_bins: int = 10) -> pd.DataFrame:
+    """标品模型分等频分箱分析，从低到高排列（第1箱分数最低）。
+
+    列：分箱 | 分箱区间 | 样本数 | 样本占比 | 逾期数 | 逾期率 | Lift | 累计KS
+    末行追加 All 合计行。
+    逾期率 = 逾期1样本数 / (0+1有效样本总和)
+    Lift   = 箱内逾期率 / 全局逾期率
+    累计KS = |累计好样本率 - 累计坏样本率|（从低到高累计）
+    """
+    arr_s = np.array(score)
+    arr_l = np.array(label)
+    total_n = len(arr_s)
+
+    # 全局逾期率（只用 0/1 有效样本）
+    valid_mask = (arr_l == 0) | (arr_l == 1)
+    total_bad  = int(arr_l[valid_mask].sum())
+    total_good = int((arr_l[valid_mask] == 0).sum())
+    total_valid = total_bad + total_good
+    overall_bad_rate = total_bad / total_valid if total_valid > 0 else 0
+
+    df = pd.DataFrame({"score": arr_s, "label": arr_l})
+    try:
+        df["bin"] = pd.qcut(df["score"], q=n_bins, duplicates="drop", labels=False) + 1
+    except Exception:
+        df["bin"] = 1
+
+    rows = []
+    for bin_id, g in df.groupby("bin", sort=True):
+        n      = len(g)
+        vm     = (g["label"] == 0) | (g["label"] == 1)
+        bad    = int(g.loc[vm, "label"].sum())
+        good   = int((g.loc[vm, "label"] == 0).sum())
+        valid  = bad + good
+        br     = bad / valid if valid > 0 else None
+        lift   = round(br / overall_bad_rate, 4) if (br is not None and overall_bad_rate > 0) else None
+        rows.append({
+            "分箱":   int(bin_id),
+            "样本数": n,
+            "样本占比": round(n / total_n, 4),
+            "逾期数": bad,
+            "好样本数": good,
+            "逾期率": round(br, 4) if br is not None else None,
+            "Lift":  lift,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    grp = pd.DataFrame(rows)
+
+    # 分箱区间
+    grp.insert(1, "分箱区间", _make_bin_labels(
+        df.groupby("bin", sort=True)["score"].min().tolist(),
+        df.groupby("bin", sort=True)["score"].max().tolist(),
+    ))
+
+    # 累计KS（从低到高）
+    cum_bad  = grp["逾期数"].cumsum()
+    cum_good = grp["好样本数"].cumsum()
+    cum_bad_rate  = cum_bad  / total_bad  if total_bad  > 0 else cum_bad  * 0
+    cum_good_rate = cum_good / total_good if total_good > 0 else cum_good * 0
+    grp["累计KS"] = (cum_bad_rate - cum_good_rate).abs().round(4)
+
+    # All 合计行
+    all_br   = total_bad / total_valid if total_valid > 0 else None
+    all_row  = {
+        "分箱":     "All",
+        "分箱区间": f"[{arr_s.min()}, {arr_s.max()}]",
+        "样本数":   total_n,
+        "样本占比": 1.0,
+        "逾期数":   total_bad,
+        "好样本数": total_good,
+        "逾期率":   round(all_br, 4) if all_br is not None else None,
+        "Lift":     1.0,
+        "累计KS":   grp["累计KS"].max(),
+    }
+    grp = pd.concat([grp, pd.DataFrame([all_row])], ignore_index=True)
+    grp = grp.drop(columns=["好样本数"])
+    return grp
+
+
+def _monthly_stats(y_true, y_pred, months, true_edges, pred_edges, labels=None) -> pd.DataFrame:
+    """按月计算每月的 MAE、MAPE、样本数及真实值/预测值各桶样本数和占比。
+    返回每行一个月份的宽表，列包括：
+      月份 | 样本数 | MAE | MAPE(%) | 真实值_桶1_n | 真实值_桶1_占比 | ... | 预测值_桶1_n | ...
+    """
+    true_bin_labels = _edges_to_bin_labels(true_edges)
+    pred_bin_labels = _edges_to_bin_labels(pred_edges)
+    n_true_bins = len(true_bin_labels)
+    n_pred_bins = len(pred_bin_labels)
+
+    df = pd.DataFrame({"y": np.array(y_true), "p": np.array(y_pred), "month": np.array(months)})
+    if labels is not None:
+        df["_label"] = np.array(labels)
+    df["真实桶"] = pd.cut(df["y"], bins=true_edges, labels=False, include_lowest=True).astype("Int64") + 1
+    df["预测桶"] = pd.cut(df["p"], bins=pred_edges, labels=False, include_lowest=True).astype("Int64") + 1
+
+    rows = []
+    for month_val, g in df.groupby("month", sort=True):
+        n = len(g)
+        row = {
+            "月份": month_val,
+            "样本数": n,
+            "MAE": round(float(mean_absolute_error(g["y"].values, g["p"].values)), 4),
+            "MAPE(%)": _mape(g["y"].values, g["p"].values),
+        }
+        if labels is not None:
+            row["1值占比"] = _label_rate(g["_label"].values)
+        # 真实值各桶分布
+        for bi in range(1, n_true_bins + 1):
+            lbl = true_bin_labels[bi - 1]
+            cnt = int((g["真实桶"] == bi).sum())
+            row[f"真实值_{lbl}_n"]   = cnt
+            row[f"真实值_{lbl}_占比"] = round(cnt / n, 4) if n else 0
+        # 预测值各桶分布
+        for bi in range(1, n_pred_bins + 1):
+            lbl = pred_bin_labels[bi - 1]
+            cnt = int((g["预测桶"] == bi).sum())
+            row[f"预测值_{lbl}_n"]   = cnt
+            row[f"预测值_{lbl}_占比"] = round(cnt / n, 4) if n else 0
+        rows.append(row)
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def _get_cut_edges(values, n_bins: int, bins: list) -> list:
@@ -323,15 +738,26 @@ class ReportGenerator:
         filename: str = "分类模型评估报告",
         month_col_data: Optional[dict] = None,
         feature_importance: Optional[pd.DataFrame] = None,
+        gain_score_data: Optional[dict] = None,
+        scorecard_data: Optional[dict] = None,
+        scorecard_cols: Optional[list] = None,
+        scorecard_label_cols=None,
+        raw_df: Optional[pd.DataFrame] = None,
+        dataset_col: str = "dataset",
     ) -> dict:
         """
-        datasets:           {"数据集名": (y_true, y_score[, weight]), ...}
-        month_col_data:     {"数据集名": df_with_month_col}，若为 None 则不生成按月 sheet
-        feature_importance: 含 'feature' 和 'importance' 列的 DataFrame，
-                            传入后自动生成「特征重要性」sheet（按重要性降序，含归一化占比和累计占比）
+        datasets:            {"数据集名": (y_true, y_score[, weight]), ...}
+        month_col_data:      {"数据集名": df_with_month_col}，若为 None 则不生成按月 sheet
+        feature_importance:  含 'feature' 和 'importance' 列的 DataFrame
+        gain_score_data:     {"数据集名": (score, label)}，生成增益矩阵 sheet
+        scorecard_cols:      df 上的标品分列名列表，与 scorecard_label_col / raw_df 配合，
+                             自动拆分 train/test/oot，所有标品合并在一张 "标品分析" sheet
+        scorecard_label_cols: 逾期标签列名列表（或单个列名字符串），所有标品共用
+        scorecard_data:      {"标品名": {"数据集名": (score, label)}}，手动传数组方式（备用）
         """
         summary_rows = []
-        sheets = {}   # sheet_name -> DataFrame
+        sheets = {}
+        decile_rows = []  # 三集合分箱合并
 
         for name, vals in datasets.items():
             y_true, y_score = np.array(vals[0]), np.array(vals[1])
@@ -343,7 +769,12 @@ class ReportGenerator:
                 "坏样本数": int(y_true.sum()),
                 "坏样本率": round(float(y_true.mean()), 4),
             })
-            sheets[f"{name}_分箱分析"] = _decile_table(y_true, y_score, w)
+            bdf = _decile_table(y_true, y_score, w)
+            bdf.insert(0, "数据集", name)
+            decile_rows.append(bdf)
+
+        if decile_rows:
+            sheets["分箱分析"] = pd.concat(decile_rows, ignore_index=True)
 
         # 按月 KS sheet
         if month_col_data:
@@ -371,7 +802,8 @@ class ReportGenerator:
             if ks_month_rows:
                 sheets["按月KS_AUC"] = pd.DataFrame(ks_month_rows)
 
-            # 按月分箱 sheet（每个数据集一个 sheet）
+            # 按月分箱：三集合合并为一张 sheet
+            month_bin_all = []
             for name, mdf in month_col_data.items():
                 if name not in datasets:
                     continue
@@ -382,14 +814,81 @@ class ReportGenerator:
                 if month_col is None:
                     continue
                 tmp = pd.DataFrame({"y": y_true, "s": y_score, "month": mdf[month_col].values})
-                month_bin_rows = []
                 for month_val, g in tmp.groupby("month", sort=True):
                     bin_df = _decile_table(g["y"].values, g["s"].values)
                     bin_df.insert(0, month_col, month_val)
-                    month_bin_rows.append(bin_df)
-                if month_bin_rows:
-                    key = f"{name}_按月分箱"[:31]
-                    sheets[key] = pd.concat(month_bin_rows, ignore_index=True)
+                    bin_df.insert(0, "数据集", name)
+                    month_bin_all.append(bin_df)
+            if month_bin_all:
+                sheets["按月分箱"] = pd.concat(month_bin_all, ignore_index=True)
+
+        # 增益矩阵（可选）
+        if gain_score_data:
+            def _section_header_clf(title, cols):
+                row = {c: "" for c in cols}
+                row[cols[0]] = f"── {title} ──"
+                return pd.DataFrame([row])
+            def _blank_row_clf(cols):
+                return pd.DataFrame([{c: "" for c in cols}])
+
+            gain_parts = []
+            for name, (score, g_label) in gain_score_data.items():
+                if name not in datasets:
+                    continue
+                y_score_gain = np.array(datasets[name][1])
+                n_df_g, ratio_df_g, br_df_g = _build_gain_matrix(
+                    np.array(g_label), y_score_gain, np.array(score)
+                )
+                if gain_parts:
+                    gain_parts.append(_blank_row_clf(n_df_g.columns.tolist()))
+                gain_parts.append(_section_header_clf(f"{name} — 样本数矩阵（行=score分箱，列=预测分分箱）", n_df_g.columns.tolist()))
+                gain_parts.append(n_df_g)
+                gain_parts.append(_blank_row_clf(ratio_df_g.columns.tolist()))
+                gain_parts.append(_section_header_clf(f"{name} — 样本占比矩阵", ratio_df_g.columns.tolist()))
+                gain_parts.append(ratio_df_g)
+                gain_parts.append(_blank_row_clf(br_df_g.columns.tolist()))
+                gain_parts.append(_section_header_clf(f"{name} — 坏账率矩阵", br_df_g.columns.tolist()))
+                gain_parts.append(br_df_g)
+            if gain_parts:
+                sheets["增益矩阵"] = pd.concat(gain_parts, ignore_index=True)
+
+        # 标品模型分分析（可选）
+        # 标品模型分分析（可选）
+        # 优先从 raw_df 按列名构建，否则用手动传入的 scorecard_data
+        # scorecard_label_cols 支持单个字符串或列表
+        name_map_rev = {"训练集": "train", "验证集": "test", "OOT": "oot"}
+        _label_cols = (
+            [scorecard_label_cols] if isinstance(scorecard_label_cols, str)
+            else (scorecard_label_cols or [])
+        )
+        if scorecard_cols and _label_cols and raw_df is not None:
+            # 结构：{(标品列名, 逾期标签列名): {"数据集名": (score, label)}}
+            scorecard_data = {}
+            for col in scorecard_cols:
+                for lbl_col in _label_cols:
+                    ds_dict = {}
+                    for ds_name in datasets:
+                        ds_key = name_map_rev.get(ds_name, ds_name)
+                        sub = raw_df[raw_df[dataset_col] == ds_key].reset_index(drop=True)
+                        if sub.empty or col not in sub.columns or lbl_col not in sub.columns:
+                            continue
+                        ds_dict[ds_name] = (sub[col].values, sub[lbl_col].values)
+                    if ds_dict:
+                        scorecard_data[(col, lbl_col)] = ds_dict
+
+        if scorecard_data:
+            all_card_rows = []
+            for (card_name, lbl_col), ds_dict in scorecard_data.items():
+                for ds_name, (sc_score, sc_label) in ds_dict.items():
+                    sc_df = _scorecard_table(sc_score, sc_label)
+                    if sc_df.empty:
+                        continue
+                    sc_df.insert(0, "数据集", ds_name)
+                    sc_df.insert(0, "逾期标签", lbl_col)
+                    sc_df.insert(0, "标品名称", card_name)
+                    all_card_rows.append(sc_df)
+            if all_card_rows:
+                sheets["标品分析"] = pd.concat(all_card_rows, ignore_index=True)
 
         summary_df = pd.DataFrame(summary_rows)
         excel_path = self._path("04_model_report", f"{filename}.xlsx")
@@ -424,19 +923,28 @@ class ReportGenerator:
         month_col_data: Optional[dict] = None,
         label_col_data: Optional[dict] = None,
         feature_importance: Optional[pd.DataFrame] = None,
+        raw_df: Optional[pd.DataFrame] = None,
+        target_col: Optional[str] = None,
+        gain_score_data: Optional[dict] = None,
+        gain_score_col: Optional[str] = None,
+        gain_label_col: Optional[str] = None,
+        scorecard_data: Optional[dict] = None,
+        scorecard_cols: Optional[list] = None,
+        scorecard_label_cols=None,
     ) -> dict:
         """
-        datasets:       {"数据集名": (y_true, y_pred), ...}
-                        第一个数据集视为训练集，用于计算共享切点。
-        n_bins:         真实值等频分桶数（bins 未传时生效），默认 10
-        bins:           真实值自定义切点（传入时忽略 n_bins）
-        n_bins_pred:    预测值等频分桶数（bins_pred 未传时生效），默认 10
-        bins_pred:      预测值自定义切点（传入时忽略 n_bins_pred）
-        label_col_data: {"数据集名": array_like}，各集合对应的二值列（0/1），
-                        传入后分桶表末尾加 '1值占比'，矩阵增加 1值占比矩阵
-        真实值分桶：切点由训练集真实值计算，三集合共享，合并为一张 sheet "真实值分桶"
-        预测值分桶：切点由训练集预测值计算，三集合共享，合并为一张 sheet "预测值分桶"
-        分桶矩阵：三集合合并为一张 sheet "分桶矩阵"，含 MAPE / 样本数占比 / 1值占比（可选）矩阵
+        datasets:         {"数据集名": (y_true, y_pred), ...}
+                          第一个数据集视为训练集，用于计算共享切点。
+        n_bins:           真实值等频分桶数（bins 未传时生效），默认 10
+        bins:             真实值自定义切点（传入时忽略 n_bins）
+        n_bins_pred:      预测值等频分桶数（bins_pred 未传时生效），默认 10
+        bins_pred:        预测值自定义切点（传入时忽略 n_bins_pred）
+        label_col_data:   {"数据集名": array_like}，各集合对应的二值列（0/1）
+        gain_score_data:  {"数据集名": (score, label)}，各集合的外部 score 和逾期标签（手动传数组）
+        gain_score_col:   raw_df 中的 score 列名，与 gain_label_col 配合使用，
+                          自动按 dataset 列拆分，优先级高于 gain_score_data
+        gain_label_col:   raw_df 中的逾期标签列名（0/1），与 gain_score_col 配合使用
+        以上两种方式传入任意一种均可生成 "增益矩阵" sheet
         """
         summary_rows = []
         sheets = {}
@@ -492,16 +1000,19 @@ class ReportGenerator:
         if merged_pred_rows:
             sheets["预测值分桶"] = pd.concat(merged_pred_rows, ignore_index=True)
 
-        # 分桶矩阵 sheet：三集合合并，含 MAPE + 样本数/占比 + 1值占比（可选）
+        # 分桶矩阵 sheet：三集合合并，含 MAPE + 样本数 + 样本占比 + 1值占比（可选）
         mat_parts = []
-        for ds_name, (mape_df, count_df, label_df) in merged_matrix_rows:
+        for ds_name, (mape_df, n_df, ratio_df, label_df) in merged_matrix_rows:
             if mat_parts:
                 mat_parts.append(_blank_row(mape_df.columns.tolist()))
             mat_parts.append(_section_header(f"{ds_name} — MAPE矩阵（行=真实值桶，列=预测值桶）", mape_df.columns.tolist()))
             mat_parts.append(mape_df)
-            mat_parts.append(_blank_row(count_df.columns.tolist()))
-            mat_parts.append(_section_header(f"{ds_name} — 样本数/占比矩阵", count_df.columns.tolist()))
-            mat_parts.append(count_df)
+            mat_parts.append(_blank_row(n_df.columns.tolist()))
+            mat_parts.append(_section_header(f"{ds_name} — 样本数矩阵", n_df.columns.tolist()))
+            mat_parts.append(n_df)
+            mat_parts.append(_blank_row(ratio_df.columns.tolist()))
+            mat_parts.append(_section_header(f"{ds_name} — 样本占比矩阵", ratio_df.columns.tolist()))
+            mat_parts.append(ratio_df)
             if label_df is not None:
                 mat_parts.append(_blank_row(label_df.columns.tolist()))
                 mat_parts.append(_section_header(f"{ds_name} — 1值占比矩阵", label_df.columns.tolist()))
@@ -509,7 +1020,78 @@ class ReportGenerator:
         if mat_parts:
             sheets["分桶矩阵"] = pd.concat(mat_parts, ignore_index=True)
 
-        # 按月分桶 sheet
+        # 增益矩阵 sheet（可选）
+        # 优先从 raw_df 按列名构建，否则用手动传入的 gain_score_data
+        name_map_rev = {"训练集": "train", "验证集": "test", "OOT": "oot"}
+        if gain_score_col and gain_label_col and raw_df is not None:
+            ds_col = "dataset"
+            gain_score_data = {}
+            for ds_name in datasets:
+                ds_key = name_map_rev.get(ds_name, ds_name)
+                sub = raw_df[raw_df[ds_col] == ds_key].reset_index(drop=True)
+                if sub.empty or gain_score_col not in sub.columns or gain_label_col not in sub.columns:
+                    continue
+                gain_score_data[ds_name] = (sub[gain_score_col].values, sub[gain_label_col].values)
+
+        if gain_score_data:
+            gain_parts = []
+            for name, (score, g_label) in gain_score_data.items():
+                if name not in datasets:
+                    continue
+                y_pred_gain = np.array(datasets[name][1])
+                n_df_g, ratio_df_g, br_df_g = _build_gain_matrix(
+                    np.array(g_label), y_pred_gain, np.array(score)
+                )
+                if gain_parts:
+                    gain_parts.append(_blank_row(n_df_g.columns.tolist()))
+                gain_parts.append(_section_header(f"{name} — 样本数矩阵（行=score分箱，列=预测分分箱）", n_df_g.columns.tolist()))
+                gain_parts.append(n_df_g)
+                gain_parts.append(_blank_row(ratio_df_g.columns.tolist()))
+                gain_parts.append(_section_header(f"{name} — 样本占比矩阵", ratio_df_g.columns.tolist()))
+                gain_parts.append(ratio_df_g)
+                gain_parts.append(_blank_row(br_df_g.columns.tolist()))
+                gain_parts.append(_section_header(f"{name} — 坏账率矩阵", br_df_g.columns.tolist()))
+                gain_parts.append(br_df_g)
+            if gain_parts:
+                sheets["增益矩阵"] = pd.concat(gain_parts, ignore_index=True)
+
+        # 标品模型分分析（可选）
+        # 优先从 raw_df 按列名构建
+        name_map_rev_reg = {"训练集": "train", "验证集": "test", "OOT": "oot"}
+        _label_cols_reg = (
+            [scorecard_label_cols] if isinstance(scorecard_label_cols, str)
+            else (scorecard_label_cols or [])
+        )
+        if scorecard_cols and _label_cols_reg and raw_df is not None:
+            scorecard_data = {}
+            for col in scorecard_cols:
+                for lbl_col in _label_cols_reg:
+                    ds_dict = {}
+                    for ds_name in datasets:
+                        ds_key = name_map_rev_reg.get(ds_name, ds_name)
+                        sub = raw_df[raw_df["dataset"] == ds_key].reset_index(drop=True)
+                        if sub.empty or col not in sub.columns or lbl_col not in sub.columns:
+                            continue
+                        ds_dict[ds_name] = (sub[col].values, sub[lbl_col].values)
+                    if ds_dict:
+                        scorecard_data[(col, lbl_col)] = ds_dict
+
+        if scorecard_data:
+            all_card_rows = []
+            for (card_name, lbl_col), ds_dict in scorecard_data.items():
+                for ds_name, (sc_score, sc_label) in ds_dict.items():
+                    sc_df = _scorecard_table(sc_score, sc_label)
+                    if sc_df.empty:
+                        continue
+                    sc_df.insert(0, "数据集", ds_name)
+                    sc_df.insert(0, "逾期标签", lbl_col)
+                    sc_df.insert(0, "标品名称", card_name)
+                    all_card_rows.append(sc_df)
+            if all_card_rows:
+                sheets["标品分析"] = pd.concat(all_card_rows, ignore_index=True)
+
+        # 按月分桶 sheet + 按月评估（合并三集合）
+        monthly_summary_rows = []
         if month_col_data:
             for name, mdf in month_col_data.items():
                 if name not in datasets:
@@ -524,21 +1106,19 @@ class ReportGenerator:
                                     "month": mdf[month_col].values})
                 if lbl_all is not None:
                     tmp["_label"] = lbl_all
-                rows_true, rows_pred = [], []
-                for month_val, g in tmp.groupby("month", sort=True):
-                    lbl_g = g["_label"].values if lbl_all is not None else None
-                    bdf_t = _bucket_table(g["y"].values, g["p"].values,
-                                          by="true", cut_edges=true_edges, labels=lbl_g)
-                    bdf_p = _bucket_table(g["y"].values, g["p"].values,
-                                          by="pred", cut_edges=pred_edges, labels=lbl_g)
-                    bdf_t.insert(0, month_col, month_val)
-                    bdf_p.insert(0, month_col, month_val)
-                    rows_true.append(bdf_t)
-                    rows_pred.append(bdf_p)
-                if rows_true:
-                    sheets[f"{name}_按月真实值分桶"[:31]] = pd.concat(rows_true, ignore_index=True)
-                if rows_pred:
-                    sheets[f"{name}_按月预测值分桶"[:31]] = pd.concat(rows_pred, ignore_index=True)
+
+                # 按月汇总指标（每月一行）
+                ms_df = _monthly_stats(
+                    y_true_all, y_pred_all, mdf[month_col].values,
+                    true_edges, pred_edges,
+                    labels=lbl_all,
+                )
+                if not ms_df.empty:
+                    ms_df.insert(0, "数据集", name)
+                    monthly_summary_rows.append(ms_df)
+
+        if monthly_summary_rows:
+            sheets["按月评估"] = pd.concat(monthly_summary_rows, ignore_index=True)
 
         summary_df = pd.DataFrame(summary_rows)
         excel_path = self._path("04_model_report", f"{filename}.xlsx")
@@ -551,6 +1131,11 @@ class ReportGenerator:
             fi_df = _build_feature_importance_df(feature_importance)
             if fi_df is not None:
                 fi_df.to_excel(writer, sheet_name="特征重要性", index=False)
+            # 特征箱线图 sheet
+            if feature_importance is not None and raw_df is not None and target_col is not None:
+                _write_feature_binplot_sheet(
+                    writer, raw_df, target_col, feature_importance
+                )
 
         html = self._build_reg_html(summary_df, sheets, filename)
         with open(html_path, "w", encoding="utf-8") as f:
@@ -558,6 +1143,138 @@ class ReportGenerator:
 
         return {"summary": summary_df, "sheets": sheets,
                 "excel_path": excel_path, "html_path": html_path}
+
+    # ------------------------------------------------------------------ #
+    #  DataFrame 入口 — 分类
+    # ------------------------------------------------------------------ #
+    def classification_report_from_df(
+        self,
+        df: pd.DataFrame,
+        target_col: str,
+        pred_col: str,
+        dataset_col: str = "dataset",
+        month_col: Optional[str] = None,
+        weight_col: Optional[str] = None,
+        filename: str = "分类模型评估报告",
+        feature_importance: Optional[pd.DataFrame] = None,
+        gain_score_col: Optional[str] = None,
+        gain_label_col: Optional[str] = None,
+        scorecard_cols: Optional[list] = None,
+        scorecard_label_cols=None,
+        scorecard_data: Optional[dict] = None,
+    ) -> dict:
+        """
+        直接传入完整 DataFrame，内部按 dataset_col 拆分为 train / test / oot 三个集合。
+
+        dataset_col 的值约定：'train' = 训练集，'test' = 验证集，'oot' = OOT
+        month_col:           月份列名，传入后生成按月 KS/AUC 和按月分箱 sheet
+        weight_col:          样本权重列名，不传则等权
+        gain_score_col:      score 列名，与 gain_label_col 配合生成增益矩阵 sheet
+        gain_label_col:      逾期标签列名（0/1）
+        scorecard_cols:      标品分列名列表，与 scorecard_label_col 配合生成标品分析 sheet
+        scorecard_label_cols: 逾期标签列名列表（或单个列名字符串），所有标品共用
+        scorecard_data:      手动传数组方式（备用）
+        """
+        name_map = {"train": "训练集", "test": "验证集", "oot": "OOT"}
+        datasets = {}
+        month_col_data = {} if month_col else None
+        gain_score_data = {} if (gain_score_col and gain_label_col) else None
+
+        for key in ["train", "test", "oot"]:
+            sub = df[df[dataset_col] == key].reset_index(drop=True)
+            if sub.empty:
+                continue
+            name = name_map[key]
+            w = sub[weight_col].values if weight_col else None
+            datasets[name] = (sub[target_col].values, sub[pred_col].values) + ((w,) if w is not None else ())
+            if month_col and month_col in sub.columns:
+                month_col_data[name] = sub[[month_col]].reset_index(drop=True)
+            if gain_score_data is not None and gain_score_col in sub.columns and gain_label_col in sub.columns:
+                gain_score_data[name] = (sub[gain_score_col].values, sub[gain_label_col].values)
+
+        return self.classification_report(
+            datasets,
+            filename=filename,
+            month_col_data=month_col_data if month_col_data else None,
+            feature_importance=feature_importance,
+            gain_score_data=gain_score_data if gain_score_data else None,
+            scorecard_cols=scorecard_cols,
+            scorecard_label_cols=scorecard_label_cols,
+            scorecard_data=scorecard_data,
+            raw_df=df,
+            dataset_col=dataset_col,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  DataFrame 入口 — 回归
+    # ------------------------------------------------------------------ #
+    def regression_report_from_df(
+        self,
+        df: pd.DataFrame,
+        target_col: str,
+        pred_col: str,
+        dataset_col: str = "dataset",
+        month_col: Optional[str] = None,
+        label_col: Optional[str] = None,
+        gain_score_col: Optional[str] = None,
+        gain_label_col: Optional[str] = None,
+        scorecard_cols: Optional[list] = None,
+        scorecard_label_cols=None,
+        scorecard_data: Optional[dict] = None,
+        filename: str = "回归模型评估报告",
+        n_bins: int = 10,
+        bins: list = None,
+        n_bins_pred: int = 10,
+        bins_pred: list = None,
+        feature_importance: Optional[pd.DataFrame] = None,
+    ) -> dict:
+        """
+        直接传入完整 DataFrame，内部按 dataset_col 拆分为 train / test / oot 三个集合。
+
+        dataset_col 的值约定：'train' = 训练集，'test' = 验证集，'oot' = OOT
+        month_col:           月份列名，传入后生成按月分桶和按月评估 sheet
+        label_col:           二值列名（0/1），传入后在分桶表和矩阵中加 1值占比
+        gain_score_col:      score 列名，与 gain_label_col 配合生成增益矩阵 sheet
+        gain_label_col:      逾期标签列名（0/1），与 gain_score_col 配合使用
+        scorecard_cols:      标品分列名列表，与 scorecard_label_col 配合生成标品分析 sheet
+        scorecard_label_cols: 逾期标签列名列表（或单个列名字符串），所有标品共用
+        scorecard_data:      手动传数组方式（备用）
+        切点由训练集（train）计算，三集合共享
+        """
+        name_map = {"train": "训练集", "test": "验证集", "oot": "OOT"}
+        datasets = {}
+        month_col_data = {} if month_col else None
+        label_col_data = {} if label_col else None
+
+        for key in ["train", "test", "oot"]:
+            sub = df[df[dataset_col] == key].reset_index(drop=True)
+            if sub.empty:
+                continue
+            name = name_map[key]
+            datasets[name] = (sub[target_col].values, sub[pred_col].values)
+            if month_col and month_col in sub.columns:
+                month_col_data[name] = sub[[month_col]].reset_index(drop=True)
+            if label_col and label_col in sub.columns:
+                label_col_data[name] = sub[label_col].values
+
+        return self.regression_report(
+            datasets,
+            filename=filename,
+            n_bins=n_bins,
+            bins=bins,
+            n_bins_pred=n_bins_pred,
+            bins_pred=bins_pred,
+            month_col_data=month_col_data if month_col_data else None,
+            label_col_data=label_col_data if label_col_data else None,
+            feature_importance=feature_importance,
+            raw_df=df,
+            target_col=target_col,
+            gain_score_col=gain_score_col,
+            gain_label_col=gain_label_col,
+            scorecard_cols=scorecard_cols,
+            scorecard_label_cols=scorecard_label_cols,
+            scorecard_data=scorecard_data,
+        )
 
     # ------------------------------------------------------------------ #
     #  特征分析报告（整体 + by dataset + by month，汇总到一个 Excel）
@@ -570,6 +1287,7 @@ class ReportGenerator:
         month_col: Optional[str] = "month",
         cat_cols: Optional[list] = None,
         filename: str = "特征分析报告",
+        target_col: Optional[str] = None,
     ) -> str:
         """
         将整体、by dataset、by month 三个维度的缺失率 / 一值率 / 分位数统计
@@ -583,22 +1301,31 @@ class ReportGenerator:
         cat_cols = cat_cols or []
         analyzer = FeatureAnalyzer(df[features], cat_cols=cat_cols)
 
-        def _stack(blocks: list) -> pd.DataFrame:
-            """把多个 DataFrame 纵向拼接，中间插入标题行 + 空行。
-            blocks: [(title, df), ...]
-            """
-            parts = []
-            for title, bdf in blocks:
-                if bdf is None or (isinstance(bdf, pd.DataFrame) and bdf.empty):
-                    continue
-                # 标题行（单列，其余 NaN）
-                header = pd.DataFrame([[title] + [np.nan] * (len(bdf.columns) - 1)],
-                                      columns=bdf.columns)
-                parts.append(header)
-                parts.append(bdf)
-                # 空行
-                parts.append(pd.DataFrame([[np.nan] * len(bdf.columns)], columns=bdf.columns))
-            return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+        def _merge_stats(mr, sr, qs) -> pd.DataFrame:
+            """把缺失率、一值率、分位数横向合并为每特征一行。"""
+            mr2 = mr.rename(columns={"缺失数": "缺失数", "缺失率": "缺失率"})
+            sr2 = sr.rename(columns={"最高频值": "最高频值", "一值率": "一值率"})
+            qs2 = qs.drop(columns=["样本数"], errors="ignore") if "样本数" in qs.columns else qs.copy()
+            merged = mr2.merge(sr2, on="特征名", how="outer").merge(qs2, on="特征名", how="outer")
+            return merged
+
+        def _merge_group_stats(group_dict) -> pd.DataFrame:
+            """把 by_group 结果的缺失率、一值率、分位数横向合并，每特征+分组一行。"""
+            mr = group_dict.get("缺失率")
+            sr = group_dict.get("一值率")
+            qs = group_dict.get("分位数统计")
+            if mr is None:
+                return pd.DataFrame()
+            # 分组列是第一列
+            group_col = mr.columns[0]
+            sr2 = sr.rename(columns={"最高频值": "最高频值", "一值率": "一值率"}) if sr is not None else None
+            qs2 = qs.drop(columns=["样本数"], errors="ignore") if qs is not None and "样本数" in qs.columns else (qs.copy() if qs is not None else None)
+            merged = mr
+            if sr2 is not None:
+                merged = merged.merge(sr2, on=[group_col, "特征名"], how="outer")
+            if qs2 is not None:
+                merged = merged.merge(qs2, on=[group_col, "特征名"], how="outer")
+            return merged
 
         excel_path = self._path("01_feature_analysis", f"{filename}.xlsx")
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
@@ -607,7 +1334,7 @@ class ReportGenerator:
             mr = analyzer.missing_rate()
             sr = analyzer.single_value_rate()
             qs = analyzer.quantile_stats()
-            overall = _stack([("【缺失率】", mr), ("【一值率】", sr), ("【分位数统计】", qs)])
+            overall = _merge_stats(mr, sr, qs)
             if not overall.empty:
                 overall.to_excel(writer, sheet_name="整体", index=False)
 
@@ -615,11 +1342,7 @@ class ReportGenerator:
             if dataset_col and dataset_col in df.columns:
                 raw = df[features + [dataset_col]].copy()
                 by_ds = analyzer.by_group_analysis(dataset_col, raw)
-                ds_sheet = _stack([
-                    ("【缺失率】",     by_ds.get("缺失率")),
-                    ("【一值率】",     by_ds.get("一值率")),
-                    ("【分位数统计】", by_ds.get("分位数统计")),
-                ])
+                ds_sheet = _merge_group_stats(by_ds)
                 if not ds_sheet.empty:
                     ds_sheet.to_excel(writer, sheet_name="by_dataset", index=False)
 
@@ -627,13 +1350,109 @@ class ReportGenerator:
             if month_col and month_col in df.columns:
                 raw_m = df[features + [month_col]].copy()
                 by_m = analyzer.by_group_analysis(month_col, raw_m)
-                m_sheet = _stack([
-                    ("【缺失率】",     by_m.get("缺失率")),
-                    ("【一值率】",     by_m.get("一值率")),
-                    ("【分位数统计】", by_m.get("分位数统计")),
-                ])
+                m_sheet = _merge_group_stats(by_m)
                 if not m_sheet.empty:
                     m_sheet.to_excel(writer, sheet_name="by_month", index=False)
+
+            # ── 特征分箱图（按 target_col 均值）─────────────────────────
+            if (
+                target_col is not None
+                and dataset_col is not None
+                and dataset_col in df.columns
+            ):
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                from io import BytesIO
+                from openpyxl.drawing.image import Image as XLImage
+
+                dataset_map = {"train": "训练集", "test": "验证集", "oot": "OOT"}
+                present_datasets = [
+                    d for d in ["train", "test", "oot"]
+                    if d in df[dataset_col].unique()
+                ]
+
+                wb = writer.book
+                ws = wb.create_sheet("特征分箱图")
+
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                import matplotlib.font_manager as _fm
+                from io import BytesIO
+                from openpyxl.drawing.image import Image as XLImage
+
+                # 中文字体
+                _cn_font = None
+                for _fn in ["Microsoft YaHei", "SimHei", "Noto Sans SC", "SimSun"]:
+                    if any(f.name == _fn for f in _fm.fontManager.ttflist):
+                        _cn_font = _fn
+                        break
+                if _cn_font:
+                    plt.rcParams["font.family"] = _cn_font
+                plt.rcParams["axes.unicode_minus"] = False
+
+                dataset_map = {"train": "训练集", "test": "验证集", "oot": "OOT"}
+                present_datasets = [
+                    d for d in ["train", "test", "oot"]
+                    if d in df[dataset_col].unique()
+                ]
+
+                wb = writer.book
+                ws = wb.create_sheet("特征分箱图")
+
+                # 第1列写特征名，图从第2列开始，每张图占 15行 x 8列
+                row_height = 15
+                col_width  = 8
+                name_col   = 1   # 特征名文字列
+                img_start_col = 2  # 图起始列
+
+                for feat_idx, feat in enumerate(features):
+                    try:
+                        binned = pd.qcut(df[feat], q=5, duplicates="drop", labels=None)
+                    except Exception:
+                        continue
+
+                    bin_labels = [str(b) for b in binned.cat.categories]
+                    df_work = df[[feat, dataset_col, target_col]].copy()
+                    df_work["__bin__"] = binned.values
+
+                    anchor_row = feat_idx * row_height + 1
+
+                    # 特征名写在第1列
+                    ws.cell(row=anchor_row, column=name_col, value=feat)
+
+                    for ds_idx, ds_key in enumerate(present_datasets):
+                        ds_label = dataset_map[ds_key]
+                        subset = df_work[df_work[dataset_col] == ds_key]
+
+                        means = (
+                            subset.groupby("__bin__", observed=True)[target_col]
+                            .mean()
+                            .reindex(binned.cat.categories)
+                        )
+
+                        fig, ax = plt.subplots(figsize=(4.2, 3.0))
+                        ax.bar(range(len(means)), means.values)
+                        ax.set_xticks(range(len(bin_labels)))
+                        ax.set_xticklabels(bin_labels, rotation=45, ha="right", fontsize=7)
+                        ax.set_title(ds_label, fontsize=9)
+                        ax.set_ylabel(f"{target_col} 均值", fontsize=8)
+                        ax.set_xlabel(feat, fontsize=8)
+                        fig.tight_layout()
+
+                        buf = BytesIO()
+                        fig.savefig(buf, format="png", dpi=96)
+                        plt.close(fig)
+                        buf.seek(0)
+
+                        img = XLImage(buf)
+                        img.width  = 300
+                        img.height = 220
+
+                        anchor_col = img_start_col + ds_idx * col_width
+                        cell = ws.cell(row=anchor_row, column=anchor_col)
+                        ws.add_image(img, cell.coordinate)
 
         return excel_path
 

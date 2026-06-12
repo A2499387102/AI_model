@@ -1,0 +1,935 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'><title>XGBoost_回归评估_自定义分桶</title><style>body{font-family:微软雅黑,Arial;margin:20px}h1,h2{color:#2c3e50}.tbl{border-collapse:collapse;width:100%;margin-bottom:20px}.tbl th{background:#2c3e50;color:#fff;padding:6px 10px}.tbl td{padding:5px 10px;border:1px solid #ccc}.tbl tr:nth-child(even){background:#f2f2f2}</style></head><body><h1>XGBoost_回归评估_自定义分桶</h1><h2>汇总指标</h2><table border="1" class="dataframe tbl">
+  <thead>
+    <tr style="text-align: center;">
+      <th>数据集</th>
+      <th>RMSE</th>
+      <th>MAE</th>
+      <th>R2</th>
+      <th>MAPE(%)</th>
+      <th>Pearson相关系数</th>
+      <th>Pearson_p值</th>
+      <th>Spearman相关系数</th>
+      <th>Spearman_p值</th>
+      <th>样本量</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>训练集</td>
+      <td>2.9755</td>
+      <td>2.3675</td>
+      <td>-0.0001</td>
+      <td>128.6282</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>195</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>2.9162</td>
+      <td>2.0777</td>
+      <td>-0.0000</td>
+      <td>102.0613</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>49</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>2.9948</td>
+      <td>2.3937</td>
+      <td>-0.0184</td>
+      <td>136.0461</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>2756</td>
+    </tr>
+  </tbody>
+</table><h2>真实值分桶</h2><table border="1" class="dataframe tbl">
+  <thead>
+    <tr style="text-align: center;">
+      <th>数据集</th>
+      <th>分桶</th>
+      <th>分箱区间</th>
+      <th>样本数</th>
+      <th>样本占比</th>
+      <th>真实最小值</th>
+      <th>真实最大值</th>
+      <th>真实均值</th>
+      <th>预测均值</th>
+      <th>预测最低值</th>
+      <th>预测最高值</th>
+      <th>MAE</th>
+      <th>MAPE(%)</th>
+      <th>误差(预测-真实)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>训练集</td>
+      <td>1</td>
+      <td>[-7.8595, -2.97395]</td>
+      <td>31</td>
+      <td>0.1590</td>
+      <td>-7.8595</td>
+      <td>-3.0422</td>
+      <td>-4.4309</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>4.2324</td>
+      <td>95.2310</td>
+      <td>4.2323</td>
+    </tr>
+    <tr>
+      <td>训练集</td>
+      <td>2</td>
+      <td>(-2.97395, -1.50295]</td>
+      <td>39</td>
+      <td>0.2000</td>
+      <td>-2.9057</td>
+      <td>-1.5226</td>
+      <td>-2.1316</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>1.9330</td>
+      <td>90.3725</td>
+      <td>1.9330</td>
+    </tr>
+    <tr>
+      <td>训练集</td>
+      <td>3</td>
+      <td>(-1.50295, -0.481]</td>
+      <td>28</td>
+      <td>0.1436</td>
+      <td>-1.4833</td>
+      <td>-0.5056</td>
+      <td>-0.9413</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>0.7428</td>
+      <td>76.1168</td>
+      <td>0.7427</td>
+    </tr>
+    <tr>
+      <td>训练集</td>
+      <td>4</td>
+      <td>(-0.481, 0.45845]</td>
+      <td>22</td>
+      <td>0.1128</td>
+      <td>-0.4564</td>
+      <td>0.4146</td>
+      <td>0.0487</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>0.2972</td>
+      <td>366.7579</td>
+      <td>-0.2473</td>
+    </tr>
+    <tr>
+      <td>训练集</td>
+      <td>5</td>
+      <td>(0.45845, 1.5435]</td>
+      <td>25</td>
+      <td>0.1282</td>
+      <td>0.5023</td>
+      <td>1.4987</td>
+      <td>0.9531</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>1.1517</td>
+      <td>123.6238</td>
+      <td>-1.1517</td>
+    </tr>
+    <tr>
+      <td>训练集</td>
+      <td>6</td>
+      <td>(1.5435, 3.09205]</td>
+      <td>20</td>
+      <td>0.1026</td>
+      <td>1.5883</td>
+      <td>2.9974</td>
+      <td>2.2973</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>2.4958</td>
+      <td>109.0890</td>
+      <td>-2.4959</td>
+    </tr>
+    <tr>
+      <td>训练集</td>
+      <td>7</td>
+      <td>(3.09205, 7.5754]</td>
+      <td>30</td>
+      <td>0.1538</td>
+      <td>3.1867</td>
+      <td>7.5754</td>
+      <td>4.7692</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>4.9678</td>
+      <td>104.4500</td>
+      <td>-4.9678</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>1</td>
+      <td>[-8.1939, -3.01315]</td>
+      <td>7</td>
+      <td>0.1429</td>
+      <td>-8.1939</td>
+      <td>-3.3508</td>
+      <td>-4.7481</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>4.5496</td>
+      <td>95.4113</td>
+      <td>4.5495</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>2</td>
+      <td>(-3.01315, -1.40715]</td>
+      <td>7</td>
+      <td>0.1429</td>
+      <td>-2.6755</td>
+      <td>-1.5086</td>
+      <td>-1.9844</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>1.7858</td>
+      <td>89.6772</td>
+      <td>1.7858</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>3</td>
+      <td>(-1.40715, -0.55245]</td>
+      <td>7</td>
+      <td>0.1429</td>
+      <td>-1.3057</td>
+      <td>-0.7016</td>
+      <td>-1.0452</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>0.8466</td>
+      <td>79.7198</td>
+      <td>0.8466</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>4</td>
+      <td>(-0.55245, 0.4169]</td>
+      <td>9</td>
+      <td>0.1837</td>
+      <td>-0.4033</td>
+      <td>0.2082</td>
+      <td>-0.1696</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>0.1450</td>
+      <td>106.3727</td>
+      <td>-0.0290</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>5</td>
+      <td>(0.4169, 1.30585]</td>
+      <td>8</td>
+      <td>0.1633</td>
+      <td>0.6256</td>
+      <td>0.9038</td>
+      <td>0.7647</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>0.9633</td>
+      <td>126.5193</td>
+      <td>-0.9633</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>6</td>
+      <td>(1.30585, 2.83495]</td>
+      <td>6</td>
+      <td>0.1224</td>
+      <td>1.7079</td>
+      <td>2.5928</td>
+      <td>2.1296</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>2.3282</td>
+      <td>109.5443</td>
+      <td>-2.3282</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>7</td>
+      <td>(2.83495, 8.5034]</td>
+      <td>5</td>
+      <td>0.1020</td>
+      <td>3.0771</td>
+      <td>8.5034</td>
+      <td>5.5118</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>5.7104</td>
+      <td>104.1144</td>
+      <td>-5.7104</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>1</td>
+      <td>[-11.5448, -2.9924]</td>
+      <td>570</td>
+      <td>0.2068</td>
+      <td>-11.5448</td>
+      <td>-3.0040</td>
+      <td>-4.6362</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>4.4376</td>
+      <td>95.3595</td>
+      <td>4.4376</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>2</td>
+      <td>(-2.9924, -1.50025]</td>
+      <td>494</td>
+      <td>0.1792</td>
+      <td>-2.9808</td>
+      <td>-1.5009</td>
+      <td>-2.2527</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>2.0542</td>
+      <td>90.8421</td>
+      <td>2.0541</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>3</td>
+      <td>(-1.50025, -0.50165]</td>
+      <td>370</td>
+      <td>0.1343</td>
+      <td>-1.4996</td>
+      <td>-0.5056</td>
+      <td>-0.9941</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>0.7956</td>
+      <td>78.2263</td>
+      <td>0.7955</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>4</td>
+      <td>(-0.50165, 0.49945]</td>
+      <td>348</td>
+      <td>0.1263</td>
+      <td>-0.4977</td>
+      <td>0.4960</td>
+      <td>-0.0075</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>0.2755</td>
+      <td>395.7568</td>
+      <td>-0.1911</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>5</td>
+      <td>(0.49945, 1.5003]</td>
+      <td>310</td>
+      <td>0.1125</td>
+      <td>0.5029</td>
+      <td>1.4990</td>
+      <td>0.9922</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>1.1907</td>
+      <td>122.0510</td>
+      <td>-1.1908</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>6</td>
+      <td>(1.5003, 3.0038]</td>
+      <td>351</td>
+      <td>0.1274</td>
+      <td>1.5016</td>
+      <td>2.9966</td>
+      <td>2.1761</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>2.3747</td>
+      <td>109.4813</td>
+      <td>-2.3747</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>7</td>
+      <td>(3.0038, 11.4595]</td>
+      <td>313</td>
+      <td>0.1136</td>
+      <td>3.0110</td>
+      <td>11.4595</td>
+      <td>4.4658</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>4.6644</td>
+      <td>104.7326</td>
+      <td>-4.6644</td>
+    </tr>
+  </tbody>
+</table><h2>预测值分桶</h2><table border="1" class="dataframe tbl">
+  <thead>
+    <tr style="text-align: center;">
+      <th>数据集</th>
+      <th>分桶</th>
+      <th>分箱区间</th>
+      <th>样本数</th>
+      <th>样本占比</th>
+      <th>真实最小值</th>
+      <th>真实最大值</th>
+      <th>真实均值</th>
+      <th>预测均值</th>
+      <th>预测最低值</th>
+      <th>预测最高值</th>
+      <th>MAE</th>
+      <th>MAPE(%)</th>
+      <th>误差(预测-真实)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>训练集</td>
+      <td>4</td>
+      <td>[-0.1986, -0.1986]</td>
+      <td>195</td>
+      <td>1.0</td>
+      <td>-7.8595</td>
+      <td>7.5754</td>
+      <td>-0.1689</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>2.3675</td>
+      <td>128.6282</td>
+      <td>-0.0297</td>
+    </tr>
+    <tr>
+      <td>验证集</td>
+      <td>4</td>
+      <td>[-0.1986, -0.1986]</td>
+      <td>49</td>
+      <td>1.0</td>
+      <td>-8.1939</td>
+      <td>8.5034</td>
+      <td>-0.1942</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>2.0777</td>
+      <td>102.0613</td>
+      <td>-0.0044</td>
+    </tr>
+    <tr>
+      <td>OOT</td>
+      <td>4</td>
+      <td>[-0.1986, -0.1986]</td>
+      <td>2756</td>
+      <td>1.0</td>
+      <td>-11.5448</td>
+      <td>11.4595</td>
+      <td>-0.6011</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>-0.1986</td>
+      <td>2.3937</td>
+      <td>136.0461</td>
+      <td>0.4025</td>
+    </tr>
+  </tbody>
+</table><h2>分桶矩阵</h2><table border="1" class="dataframe tbl">
+  <thead>
+    <tr style="text-align: center;">
+      <th>真实值区间\预测值区间</th>
+      <th>(-0.5, 0.5]</th>
+      <th>合计</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>── 训练集 — MAPE矩阵（行=真实值桶，列=预测值桶） ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>95.23</td>
+      <td>95.23</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>90.37</td>
+      <td>90.37</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>76.12</td>
+      <td>76.12</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>366.76</td>
+      <td>366.76</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>123.62</td>
+      <td>123.62</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>109.09</td>
+      <td>109.09</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>104.45</td>
+      <td>104.45</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>128.63</td>
+      <td>128.63</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>── 训练集 — 样本数矩阵 ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>31</td>
+      <td>31</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>39</td>
+      <td>39</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>28</td>
+      <td>28</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>22</td>
+      <td>22</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>25</td>
+      <td>25</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>20</td>
+      <td>20</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>30</td>
+      <td>30</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>195</td>
+      <td>195</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>── 训练集 — 样本占比矩阵 ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>0.159</td>
+      <td>0.159</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>0.2</td>
+      <td>0.2</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>0.1436</td>
+      <td>0.1436</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>0.1128</td>
+      <td>0.1128</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>0.1282</td>
+      <td>0.1282</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>0.1026</td>
+      <td>0.1026</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>0.1538</td>
+      <td>0.1538</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>1.0</td>
+      <td>1.0</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>── 验证集 — MAPE矩阵（行=真实值桶，列=预测值桶） ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>95.41</td>
+      <td>95.41</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>89.68</td>
+      <td>89.68</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>79.72</td>
+      <td>79.72</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>106.37</td>
+      <td>106.37</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>126.52</td>
+      <td>126.52</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>109.54</td>
+      <td>109.54</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>104.11</td>
+      <td>104.11</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>102.06</td>
+      <td>102.06</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>── 验证集 — 样本数矩阵 ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>7</td>
+      <td>7</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>7</td>
+      <td>7</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>7</td>
+      <td>7</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>9</td>
+      <td>9</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>8</td>
+      <td>8</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>6</td>
+      <td>6</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>5</td>
+      <td>5</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>49</td>
+      <td>49</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>── 验证集 — 样本占比矩阵 ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>0.1429</td>
+      <td>0.1429</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>0.1429</td>
+      <td>0.1429</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>0.1429</td>
+      <td>0.1429</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>0.1837</td>
+      <td>0.1837</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>0.1633</td>
+      <td>0.1633</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>0.1224</td>
+      <td>0.1224</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>0.102</td>
+      <td>0.102</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>1.0</td>
+      <td>1.0</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>── OOT — MAPE矩阵（行=真实值桶，列=预测值桶） ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>95.36</td>
+      <td>95.36</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>90.84</td>
+      <td>90.84</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>78.23</td>
+      <td>78.23</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>395.76</td>
+      <td>395.76</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>122.05</td>
+      <td>122.05</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>109.48</td>
+      <td>109.48</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>104.73</td>
+      <td>104.73</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>136.05</td>
+      <td>136.05</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>── OOT — 样本数矩阵 ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>570</td>
+      <td>570</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>494</td>
+      <td>494</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>370</td>
+      <td>370</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>348</td>
+      <td>348</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>310</td>
+      <td>310</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>351</td>
+      <td>351</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>313</td>
+      <td>313</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>2756</td>
+      <td>2756</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>── OOT — 样本占比矩阵 ──</td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>[-3.03, -3.0]</td>
+      <td>0.2068</td>
+      <td>0.2068</td>
+    </tr>
+    <tr>
+      <td>(-3.0, -1.5]</td>
+      <td>0.1792</td>
+      <td>0.1792</td>
+    </tr>
+    <tr>
+      <td>(-1.5, -0.5]</td>
+      <td>0.1343</td>
+      <td>0.1343</td>
+    </tr>
+    <tr>
+      <td>(-0.5, 0.5]</td>
+      <td>0.1263</td>
+      <td>0.1263</td>
+    </tr>
+    <tr>
+      <td>(0.5, 1.5]</td>
+      <td>0.1125</td>
+      <td>0.1125</td>
+    </tr>
+    <tr>
+      <td>(1.5, 3.0]</td>
+      <td>0.1274</td>
+      <td>0.1274</td>
+    </tr>
+    <tr>
+      <td>(3.0, 3.03]</td>
+      <td>0.1136</td>
+      <td>0.1136</td>
+    </tr>
+    <tr>
+      <td>合计</td>
+      <td>1.0</td>
+      <td>1.0</td>
+    </tr>
+  </tbody>
+</table></body></html>
