@@ -103,10 +103,18 @@ def _write_feature_binplot_sheet(
     from openpyxl.drawing.image import Image as XLImage
     from openpyxl.utils import get_column_letter
 
-    # 中文字体
+    # 中文字体：优先系统字体，Linux 上常见 Noto/WenQuanYi，找不到则退到无衬线
+    _CN_CANDIDATES = [
+        "Microsoft YaHei", "SimHei", "SimSun",
+        "Noto Sans SC", "Noto Sans CJK SC", "Noto Sans CJK JP",
+        "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",
+        "AR PL UMing CN", "AR PL UKai CN",
+        "DejaVu Sans",  # fallback（无中文，但不乱码）
+    ]
     _cn_font = None
-    for _fn in ["Microsoft YaHei", "SimHei", "Noto Sans SC", "SimSun"]:
-        if any(f.name == _fn for f in _fm.fontManager.ttflist):
+    _available = {f.name for f in _fm.fontManager.ttflist}
+    for _fn in _CN_CANDIDATES:
+        if _fn in _available:
             _cn_font = _fn
             break
     if _cn_font:
@@ -114,8 +122,8 @@ def _write_feature_binplot_sheet(
     plt.rcParams["axes.unicode_minus"] = False
 
     DATASET_ORDER = [
-        ("train", "训练集"),
-        ("test",  "验证集"),
+        ("train", "Train"),
+        ("test",  "Test"),
         ("oot",   "OOT"),
     ]
 
@@ -135,27 +143,16 @@ def _write_feature_binplot_sheet(
     else:
         ws = workbook.create_sheet(title=sheet_name)
 
-    # 图片尺寸（像素 → EMU，openpyxl 用 EMU；1 px ≈ 9525 EMU at 96 dpi）
-    IMG_W_PX = 300
-    IMG_H_PX = 220
-    # Cell column widths / row heights are in Excel units; approximate pixel mapping:
-    # col width 1 unit ≈ 7 px, row height 1 unit ≈ 0.75 px
-    IMG_W_PX = 300
-    IMG_H_PX = 220
+    IMG_W_PX = 360
+    IMG_H_PX = 260
     COL_W    = IMG_W_PX / 7
     ROW_H    = IMG_H_PX / 0.75
 
     # 训练集，用于计算分箱切点
     train_df = raw_df[raw_df["dataset"] == "train"]
 
-    # 每个特征一行，第1列写特征名，图从第2列起（三张图对应 train/test/oot）
     NAME_COL  = 1
     IMG_START = 2
-    NAME_COL    = 1
-    IMG_START   = 2
-
-    # 训练集，用于计算分箱切点
-    train_df = raw_df[raw_df["dataset"] == "train"]
 
     for row_idx, feature in enumerate(top_features):
         if feature not in raw_df.columns:
@@ -175,50 +172,115 @@ def _write_feature_binplot_sheet(
             continue
 
         excel_row = row_idx + 1
-        # 第1列写特征名
         ws.cell(row=excel_row, column=NAME_COL, value=feature)
         ws.row_dimensions[excel_row].height = ROW_H
         ws.column_dimensions[get_column_letter(NAME_COL)].width = 15
 
-        for col_idx, (ds_key, ds_label) in enumerate(DATASET_ORDER):
-            sub = raw_df[raw_df["dataset"] == ds_key]
-            if sub.empty or feature not in sub.columns or target_col not in sub.columns:
+        # 预计算三个集合的全局 y 轴范围，保证同一特征三张图可直接对比
+        all_means_global = []
+        ds_agg_cache = {}
+        for ds_key, ds_label in DATASET_ORDER:
+            sub_all = raw_df[raw_df["dataset"] == ds_key]
+            if sub_all.empty or feature not in sub_all.columns or target_col not in sub_all.columns:
                 continue
-
-            sub = sub[[feature, target_col]].dropna()
+            sub_all = sub_all[[feature, target_col]].copy()
+            sub     = sub_all.dropna()
             if sub.empty:
                 continue
-
             try:
-                bins_series = pd.cut(
-                    sub[feature],
-                    bins=cut_edges,
-                    include_lowest=True,
-                    duplicates="drop",
-                )
+                bins_series = pd.cut(sub[feature], bins=cut_edges,
+                                     include_lowest=True, duplicates="drop")
             except Exception:
                 continue
-
-            agg = (
-                sub.groupby(bins_series, observed=True)[target_col]
-                .mean()
-                .reset_index()
-            )
-            agg.columns = ["bin", "mean_target"]
+            total_n = len(sub)
+            agg = sub.groupby(bins_series, observed=True).agg(
+                mean_target=(target_col, "mean"),
+                count=(target_col, "count"),
+            ).reset_index()
+            agg.columns = ["bin", "mean_target", "count"]
             agg["bin_str"] = agg["bin"].astype(str)
+            agg["pct"] = agg["count"] / total_n
 
-            # 绘图，标题只写 dataset 名
+            # Missing 箱统计（特征值为空的样本）
+            sub_miss = sub_all[sub_all[feature].isna()]
+            miss_mean = float(sub_miss[target_col].mean()) if not sub_miss.empty else np.nan
+            miss_n    = len(sub_miss)
+            miss_pct  = miss_n / len(sub_all) if len(sub_all) > 0 else 0.0
+
+            # 数据集整体均值（含 Missing 样本，用于伪Lift基准）
+            ds_overall_mean = float(sub_all[target_col].mean()) if not sub_all.empty else np.nan
+
+            ds_agg_cache[ds_key] = (agg, miss_mean, miss_n, miss_pct, ds_overall_mean)
+            all_means_global.extend(agg["mean_target"].dropna().tolist())
+            if not np.isnan(miss_mean):
+                all_means_global.append(miss_mean)
+
+        if not all_means_global:
+            continue
+        g_ymin = float(np.min(all_means_global))
+        g_ymax = float(np.max(all_means_global))
+        g_pad  = (g_ymax - g_ymin) * 0.18 if (g_ymax - g_ymin) > 0 else abs(g_ymax) * 0.2 + 0.1
+        y_lo, y_hi = g_ymin - g_pad * 0.3, g_ymax + g_pad
+
+        for col_idx, (ds_key, ds_label) in enumerate(DATASET_ORDER):
+            if ds_key not in ds_agg_cache:
+                continue
+            agg, miss_mean, miss_n, miss_pct, ds_overall_mean = ds_agg_cache[ds_key]
+
+            # 追加 Missing 柱数据
+            has_miss = miss_n > 0 and not np.isnan(miss_mean)
+            bin_strs = agg["bin_str"].tolist() + (["Missing"] if has_miss else [])
+            means    = np.append(agg["mean_target"].values, miss_mean) if has_miss else agg["mean_target"].values.copy()
+            pcts     = np.append(agg["pct"].values, miss_pct)          if has_miss else agg["pct"].values.copy()
+            n_bars   = len(bin_strs)
+            x        = np.arange(n_bars)
+
             fig, ax = plt.subplots(figsize=(IMG_W_PX / 96, IMG_H_PX / 96))
-            ax.bar(range(len(agg)), agg["mean_target"], color="#4C72B0", edgecolor="white")
-            ax.set_xticks(range(len(agg)))
-            ax.set_xticklabels(agg["bin_str"], rotation=45, ha="right", fontsize=7)
-            ax.set_title(ds_label, fontsize=8, pad=4)
-            ax.tick_params(axis="y", labelsize=7)
-            ax.set_ylabel("均值", fontsize=7)
-            plt.tight_layout()
+
+            bar_colors = ["#4C72B0"] * len(agg) + (["#B0784C"] if has_miss else [])
+            bars = ax.bar(x, means, color=bar_colors, edgecolor="white", alpha=0.85, zorder=2)
+
+            # 折线：仅连接正常箱（不含 Missing）
+            valid_x = np.arange(len(agg))
+            valid_m = agg["mean_target"].values
+            valid_mask_plot = ~np.isnan(valid_m)
+            if valid_mask_plot.sum() > 1:
+                ax.plot(valid_x[valid_mask_plot], valid_m[valid_mask_plot],
+                        color="#E84646", linewidth=1.2, marker="o", markersize=3, zorder=3)
+
+            # 柱子顶部双行标注：均值 + 伪Lift（所有箱均标注）
+            offset        = g_pad * 0.12
+            for xi, mv in zip(x, means):
+                if np.isnan(mv):
+                    continue
+                if np.isnan(ds_overall_mean) or ds_overall_mean == 0:
+                    label_str = f"{mv:.3f}"
+                else:
+                    label_str = f"{mv:.3f}\n×{mv / ds_overall_mean:.2f}"
+                ax.text(xi, mv + offset, label_str,
+                        ha="center", va="bottom", fontsize=5,
+                        color="#222222", zorder=4, linespacing=1.3)
+
+            # 柱子内部标注样本占比（白色）
+            for xi, (bar, pv, mv) in enumerate(zip(bars, pcts, means)):
+                if np.isnan(mv) or bar.get_height() == 0:
+                    continue
+                bar_mid = bar.get_y() + bar.get_height() / 2
+                ax.text(xi, bar_mid, f"{pv:.1%}",
+                        ha="center", va="center", fontsize=5.5,
+                        color="white", fontweight="bold", zorder=4)
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(bin_strs, rotation=45, ha="right", fontsize=6)
+            ax.set_title(f"{feature} - {ds_label}", fontsize=8, pad=4)
+            ax.tick_params(axis="y", labelsize=6)
+            ax.set_ylabel("Mean", fontsize=7)
+            ax.margins(x=0.05)
+            ax.set_ylim(y_lo, y_hi)
+            fig.tight_layout()
 
             buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=96)
+            fig.savefig(buf, format="png", dpi=110)
             plt.close(fig)
             buf.seek(0)
 
@@ -226,8 +288,8 @@ def _write_feature_binplot_sheet(
             img.width  = IMG_W_PX
             img.height = IMG_H_PX
 
-            excel_col   = IMG_START + col_idx
-            col_letter  = get_column_letter(excel_col)
+            excel_col  = IMG_START + col_idx
+            col_letter = get_column_letter(excel_col)
             ws.column_dimensions[col_letter].width = COL_W
             cell_addr = f"{col_letter}{excel_row}"
             ws.add_image(img, cell_addr)
@@ -258,34 +320,40 @@ def _edges_to_bin_labels(edges: list) -> list:
     """把切点边界列表直接转成区间标签，首尾相连。
     edges: [e0, e1, e2, ..., en]，生成 n 个区间。
     首区间用 [ 左闭，其余用 ( 左开，所有右端用 ] 右闭。
-    ±inf 显示为实际边界值（跳过无穷）。
+    ±inf 原样显示为 '-inf'/'+inf'（正常情况 display_edges 传入时已替换掉）。
     """
     labels = []
     for i in range(len(edges) - 1):
         l = edges[i]
         r = edges[i + 1]
         lp = "[" if i == 0 else "("
-        l_str = str(round(l, 4)) if not np.isinf(l) else str(round(r - abs(r) * 0.01, 4))
-        r_str = str(round(r, 4)) if not np.isinf(r) else str(round(l + abs(l) * 0.01, 4))
+        l_str = "-inf" if np.isinf(l) and l < 0 else ("+inf" if np.isinf(l) else str(round(l, 4)))
+        r_str = "+inf" if np.isinf(r) and r > 0 else ("-inf" if np.isinf(r) else str(round(r, 4)))
         labels.append(f"{lp}{l_str}, {r_str}]")
     return labels
 
 
 def _decile_table(y_true, y_score, weights=None, n_bins: int = 10) -> pd.DataFrame:
-    """按预测分数等频分箱，统计每箱坏样本率、Lift、累计Lift（高→低 和 低→高）"""
+    """按预测分数等频分箱，统计每箱坏样本率、Lift、累计Lift（高→低 和 低→高）；空值样本单独成 Missing 箱"""
     total_n = len(y_true)
     total_bad = int(np.array(y_true).sum())
     overall_bad_rate = total_bad / total_n if total_n > 0 else 1e-6
 
     df = pd.DataFrame({"真实值": np.array(y_true), "预测分数": np.array(y_score)})
     df["权重"] = np.array(weights) if weights is not None else 1.0
+
+    # 分离空值样本
+    miss_mask = df["预测分数"].isna()
+    df_valid = df[~miss_mask].copy()
+    df_miss  = df[miss_mask].copy()
+
     try:
-        df["分箱"] = pd.qcut(df["预测分数"], q=n_bins, duplicates="drop", labels=False) + 1
+        df_valid["分箱"] = pd.qcut(df_valid["预测分数"], q=n_bins, duplicates="drop", labels=False) + 1
     except ValueError:
-        df["分箱"] = 1
+        df_valid["分箱"] = 1
 
     rows = []
-    for bin_id, g in df.groupby("分箱"):
+    for bin_id, g in df_valid.groupby("分箱"):
         n = len(g)
         bad = int((g["真实值"] * g["权重"]).sum())
         bad_rate = bad / n if n > 0 else 0
@@ -325,40 +393,91 @@ def _decile_table(y_true, y_score, weights=None, n_bins: int = 10) -> pd.DataFra
         for cb, cn in zip(cum_bad_lh, cum_n_lh)
     ]
 
+    # Missing 箱追加到末尾
+    if not df_miss.empty:
+        mn = len(df_miss)
+        mbad = int((df_miss["真实值"] * df_miss["权重"]).sum())
+        mbad_rate = mbad / mn if mn > 0 else 0
+        mlift = round(mbad_rate / overall_bad_rate, 4) if overall_bad_rate > 0 else None
+        miss_row = pd.DataFrame([{
+            "分箱": "Missing",
+            "分箱区间": "Missing",
+            "样本数": mn,
+            "样本占比": round(mn / total_n, 4),
+            "坏样本数": mbad,
+            "加权样本数": round(float(df_miss["权重"].sum()), 2),
+            "最低分": None,
+            "最高分": None,
+            "坏样本率": round(mbad_rate, 4),
+            "Lift": mlift,
+            "累计Lift(高→低)": None,
+            "累计Lift(低→高)": None,
+        }])
+        grp = pd.concat([grp, miss_row], ignore_index=True)
+
+    # All 合计行（含 Missing 样本）
+    all_n    = total_n
+    all_bad  = int((df["真实值"] * df["权重"]).sum())
+    all_br   = all_bad / all_n if all_n > 0 else 0
+    all_row  = pd.DataFrame([{
+        "分箱":           "All",
+        "分箱区间":       "All",
+        "样本数":         all_n,
+        "样本占比":       1.0,
+        "坏样本数":       all_bad,
+        "加权样本数":     round(float(df["权重"].sum()), 2),
+        "最低分":         None,
+        "最高分":         None,
+        "坏样本率":       round(all_br, 4),
+        "Lift":           1.0,
+        "累计Lift(高→低)": None,
+        "累计Lift(低→高)": None,
+    }])
+    grp = pd.concat([grp, all_row], ignore_index=True)
+
     return grp
 
 
 def _bucket_table(y_true, y_pred, n_bins: int = 10, bins: list = None,
                   by: str = "true", cut_edges: list = None,
-                  labels: np.ndarray = None) -> pd.DataFrame:
-    """按真实值或预测值分桶，统计每桶误差指标。
+                  labels: np.ndarray = None,
+                  display_edges: list = None) -> pd.DataFrame:
+    """按真实值或预测值分桶，统计每桶误差指标；空值样本单独成 Missing 箱。
 
-    by:        'true' — 按真实值分桶；'pred' — 按预测值分桶
-    bins:      自定义切点，传入时忽略 n_bins，自动补 ±inf
-    cut_edges: 已计算好的完整 bin 边界（含 ±inf），优先级高于 bins/n_bins
-    labels:    与 y_true 等长的二值数组（0/1），传入时在分桶结果末尾加 '1值占比' 列
+    by:            'true' — 按真实值分桶；'pred' — 按预测值分桶
+    bins:          自定义切点，传入时忽略 n_bins，自动补 ±inf
+    cut_edges:     已计算好的完整 bin 边界（含 ±inf），优先级高于 bins/n_bins，用于分桶
+    display_edges: 用于生成分箱区间标签的边界（±inf 已替换为训练集实际 min/max），
+                   传入时所有集合共用同一套标签；不传时退回每箱实际 min/max 推导
+    labels:        与 y_true 等长的二值数组（0/1），传入时在分桶结果末尾加 '1值占比' 列
     """
     total_n = len(y_true)
     df = pd.DataFrame({"真实值": np.array(y_true), "预测值": np.array(y_pred)})
     if labels is not None:
         df["_label"] = np.array(labels)
     col = "真实值" if by == "true" else "预测值"
+
+    # 分离空值样本：分桶列或对应列任一为空均视为 missing
+    miss_mask = df["真实值"].isna() | df["预测值"].isna()
+    df_valid = df[~miss_mask].copy()
+    df_miss  = df[miss_mask].copy()
+
     try:
         if cut_edges is not None:
-            df["分桶"] = pd.cut(df[col], bins=cut_edges, labels=False, include_lowest=True)
-            df["分桶"] = df["分桶"] + 1
+            df_valid["分桶"] = pd.cut(df_valid[col], bins=cut_edges, labels=False, include_lowest=True)
+            df_valid["分桶"] = df_valid["分桶"] + 1
         elif bins is not None:
             edges = ([-np.inf] + list(bins) + [np.inf]
                      if (bins[0] != -np.inf and bins[-1] != np.inf) else bins)
-            df["分桶"] = pd.cut(df[col], bins=edges, labels=False, include_lowest=True)
-            df["分桶"] = df["分桶"] + 1
+            df_valid["分桶"] = pd.cut(df_valid[col], bins=edges, labels=False, include_lowest=True)
+            df_valid["分桶"] = df_valid["分桶"] + 1
         else:
-            df["分桶"] = pd.qcut(df[col], q=n_bins, duplicates="drop", labels=False) + 1
+            df_valid["分桶"] = pd.qcut(df_valid[col], q=n_bins, duplicates="drop", labels=False) + 1
     except ValueError:
-        df["分桶"] = 1
+        df_valid["分桶"] = 1
 
     rows = []
-    for bin_id, g in df.groupby("分桶"):
+    for bin_id, g in df_valid.groupby("分桶"):
         n = len(g)
         mae_val  = round(float(mean_absolute_error(g["真实值"].values, g["预测值"].values)), 4)
         mape_val = _mape(g["真实值"].values, g["预测值"].values)
@@ -381,43 +500,134 @@ def _bucket_table(y_true, y_pred, n_bins: int = 10, bins: list = None,
 
     base_cols = ["分桶", "分箱区间", "样本数", "样本占比", "真实最小值", "真实最大值",
                  "真实均值", "预测均值", "预测最低值", "预测最高值",
-                 "MAE", "MAPE(%)", "误差(预测-真实)"]
+                 "误差(预测-真实)", "MAE", "MAPE(%)"]
     if labels is not None:
         base_cols.append("1值占比")
     if not rows:
         return pd.DataFrame(columns=base_cols)
     grp = pd.DataFrame(rows)
     grp["误差(预测-真实)"] = (grp["预测均值"] - grp["真实均值"]).round(4)
-    grp.insert(1, "分箱区间", _make_bin_labels(
-        grp["真实最小值"].tolist() if by == "true" else grp["预测最低值"].tolist(),
-        grp["真实最大值"].tolist() if by == "true" else grp["预测最高值"].tolist()))
+    if display_edges is not None:
+        bin_labels = _edges_to_bin_labels(display_edges)
+        label_map = {i + 1: lbl for i, lbl in enumerate(bin_labels)}
+        grp.insert(1, "分箱区间", grp["分桶"].map(lambda b: label_map.get(int(b), str(b))))
+    else:
+        grp.insert(1, "分箱区间", _make_bin_labels(
+            grp["真实最小值"].tolist() if by == "true" else grp["预测最低值"].tolist(),
+            grp["真实最大值"].tolist() if by == "true" else grp["预测最高值"].tolist()))
+
+    # Missing 箱追加到末尾
+    if not df_miss.empty:
+        mn = len(df_miss)
+        if df_miss["真实值"].notna().any() and df_miss["预测值"].notna().any():
+            mae_m  = round(float(mean_absolute_error(df_miss["真实值"].values, df_miss["预测值"].values)), 4)
+            mape_m = _mape(df_miss["真实值"].values, df_miss["预测值"].values)
+            tmean  = round(float(df_miss["真实值"].mean()), 4) if df_miss["真实值"].notna().any() else None
+            pmean  = round(float(df_miss["预测值"].mean()), 4) if df_miss["预测值"].notna().any() else None
+        else:
+            mae_m = mape_m = tmean = pmean = None
+        miss_row = {
+            "分桶": "Missing",
+            "分箱区间": "Missing",
+            "样本数": mn,
+            "样本占比": round(mn / total_n, 4),
+            "真实最小值": round(float(df_miss["真实值"].min()), 4) if df_miss["真实值"].notna().any() else None,
+            "真实最大值": round(float(df_miss["真实值"].max()), 4) if df_miss["真实值"].notna().any() else None,
+            "真实均值": tmean,
+            "预测均值": pmean,
+            "预测最低值": round(float(df_miss["预测值"].min()), 4) if df_miss["预测值"].notna().any() else None,
+            "预测最高值": round(float(df_miss["预测值"].max()), 4) if df_miss["预测值"].notna().any() else None,
+            "MAE": mae_m,
+            "MAPE(%)": mape_m,
+            "误差(预测-真实)": round(pmean - tmean, 4) if (pmean is not None and tmean is not None) else None,
+        }
+        if labels is not None:
+            miss_row["1值占比"] = _label_rate(df_miss["_label"].values)
+        grp = pd.concat([grp, pd.DataFrame([miss_row])], ignore_index=True)
+
+    # All 合计行（含 Missing 样本）
+    all_true  = df["真实值"].dropna()
+    all_pred  = df["预测值"].dropna()
+    all_n     = total_n
+    if len(all_true) > 0 and len(all_pred) > 0:
+        valid_both = df[df["真实值"].notna() & df["预测值"].notna()]
+        all_mae  = round(float(mean_absolute_error(valid_both["真实值"].values, valid_both["预测值"].values)), 4) if not valid_both.empty else None
+        all_mape = _mape(valid_both["真实值"].values, valid_both["预测值"].values) if not valid_both.empty else None
+        all_tmean = round(float(all_true.mean()), 4)
+        all_pmean = round(float(all_pred.mean()), 4)
+    else:
+        all_mae = all_mape = all_tmean = all_pmean = None
+    all_row = {
+        "分桶":       "All",
+        "分箱区间":   "All",
+        "样本数":     all_n,
+        "样本占比":   1.0,
+        "真实最小值": round(float(all_true.min()), 4) if len(all_true) > 0 else None,
+        "真实最大值": round(float(all_true.max()), 4) if len(all_true) > 0 else None,
+        "真实均值":   all_tmean,
+        "预测均值":   all_pmean,
+        "预测最低值": round(float(all_pred.min()), 4) if len(all_pred) > 0 else None,
+        "预测最高值": round(float(all_pred.max()), 4) if len(all_pred) > 0 else None,
+        "MAE":        all_mae,
+        "MAPE(%)":    all_mape,
+        "误差(预测-真实)": round(all_pmean - all_tmean, 4) if (all_pmean is not None and all_tmean is not None) else None,
+    }
+    if labels is not None:
+        all_row["1值占比"] = _label_rate(df["_label"].values)
+    grp = pd.concat([grp, pd.DataFrame([all_row])], ignore_index=True)
+
+    # 统一列顺序
+    grp = grp[[c for c in base_cols if c in grp.columns]]
+
     return grp
 
 
 def _build_cross_matrix(y_true, y_pred, true_edges: list, pred_edges: list,
-                        labels: np.ndarray = None):
-    """计算真实值桶 × 预测值桶交叉矩阵，返回 (mape_df, count_df[, label_df]) 。
+                        labels: np.ndarray = None,
+                        display_true_edges: list = None,
+                        display_pred_edges: list = None):
+    """计算真实值桶 × 预测值桶交叉矩阵；真实值或预测值为空的样本单独成 Missing 行/列。
 
-    mape_df:  格子值为 MAPE(%)
-    count_df: 格子值为 "样本数(占比%)"
-    label_df: 格子值为 1值占比（仅 labels 传入时返回，否则该位置为 None）
+    display_true_edges / display_pred_edges：±inf 已替换为训练集实际 min/max 的边界，
+    用于生成行列标签；不传则退回 _edges_to_bin_labels(true_edges/pred_edges)。
     """
     total_n = len(y_true)
     df = pd.DataFrame({"真实值": np.array(y_true), "预测值": np.array(y_pred)})
     if labels is not None:
         df["_label"] = np.array(labels)
+
+    # 分桶（pd.cut 对 NaN 自动产生 NaN，后续用 "Missing" 特殊标记覆盖）
     df["真实桶"] = pd.cut(df["真实值"], bins=true_edges, labels=False, include_lowest=True).astype("Int64") + 1
     df["预测桶"] = pd.cut(df["预测值"], bins=pred_edges, labels=False, include_lowest=True).astype("Int64") + 1
 
-    true_bins = sorted(df["真实桶"].dropna().unique())
-    pred_bins = sorted(df["预测桶"].dropna().unique())
+    # 用特殊整数 -1 标记 missing（便于后续统一 groupby 逻辑）
+    true_miss_mask = df["真实值"].isna()
+    pred_miss_mask = df["预测值"].isna()
+    MISS_ID = -1
+    df.loc[true_miss_mask, "真实桶"] = MISS_ID
+    df.loc[pred_miss_mask, "预测桶"] = MISS_ID
+
+    true_bins_raw = sorted(df["真实桶"].dropna().unique())
+    pred_bins_raw = sorted(df["预测桶"].dropna().unique())
+
+    # 区分正常箱和 missing 箱，保证 missing 在末尾
+    true_bins_normal = [b for b in true_bins_raw if b != MISS_ID]
+    pred_bins_normal = [b for b in pred_bins_raw if b != MISS_ID]
+    true_has_miss = MISS_ID in true_bins_raw
+    pred_has_miss = MISS_ID in pred_bins_raw
+    true_bins = true_bins_normal + ([MISS_ID] if true_has_miss else [])
+    pred_bins = pred_bins_normal + ([MISS_ID] if pred_has_miss else [])
+
     col_label = "真实值区间\\预测值区间"
 
-    # 从 edges 生成区间标签，按桶编号（1-based）索引
-    true_labels_all = _edges_to_bin_labels(true_edges)
-    pred_labels_all = _edges_to_bin_labels(pred_edges)
-    true_label_map  = {i + 1: lbl for i, lbl in enumerate(true_labels_all)}
-    pred_label_map  = {i + 1: lbl for i, lbl in enumerate(pred_labels_all)}
+    _te = display_true_edges if display_true_edges is not None else true_edges
+    _pe = display_pred_edges if display_pred_edges is not None else pred_edges
+    true_labels_all = _edges_to_bin_labels(_te)
+    pred_labels_all = _edges_to_bin_labels(_pe)
+    true_label_map = {i + 1: lbl for i, lbl in enumerate(true_labels_all)}
+    true_label_map[MISS_ID] = "Missing"
+    pred_label_map = {i + 1: lbl for i, lbl in enumerate(pred_labels_all)}
+    pred_label_map[MISS_ID] = "Missing"
 
     pred_cols = [pred_label_map.get(int(pb), f"预测桶{int(pb)}") for pb in pred_bins]
 
@@ -478,7 +688,7 @@ def _build_cross_matrix(y_true, y_pred, true_edges: list, pred_edges: list,
 
 
 def _build_gain_matrix(y_label, y_pred, score, n_bins: int = 10):
-    """score × 模型预测分 交叉矩阵（各自独立等频分箱）。
+    """score × 模型预测分 交叉矩阵（各自独立等频分箱）；score 或 pred 为空时单独成 Missing 箱。
 
     返回 (n_df, ratio_df, bad_rate_df)：
       n_df:        格子样本数（整数）
@@ -493,35 +703,41 @@ def _build_gain_matrix(y_label, y_pred, score, n_bins: int = 10):
         "score": np.array(score),
     })
 
-    # 各自独立等频分箱
-    try:
-        df["score_bin"] = pd.qcut(df["score"], q=n_bins, duplicates="drop", labels=False).astype("Int64") + 1
-    except Exception:
-        df["score_bin"] = 1
-    try:
-        df["pred_bin"]  = pd.qcut(df["pred"],  q=n_bins, duplicates="drop", labels=False).astype("Int64") + 1
-    except Exception:
-        df["pred_bin"] = 1
+    MISS_ID = -1
 
-    score_bins = sorted(df["score_bin"].dropna().unique())
-    pred_bins  = sorted(df["pred_bin"].dropna().unique())
-
-    # 生成列标签（用实际分数区间）
-    def _qcut_labels(series, bins):
+    def _qcut_with_edges(series, bins):
         try:
             _, edges = pd.qcut(series.dropna(), q=bins, duplicates="drop", retbins=True)
-            edges[0] = series.min(); edges[-1] = series.max()
-            return _make_bin_labels(
-                [edges[i] for i in range(len(edges)-1)],
-                [edges[i+1] for i in range(len(edges)-1)]
-            )
+            edges[0]  = -np.inf
+            edges[-1] =  np.inf
+            binned = pd.cut(series, bins=edges, labels=False, include_lowest=True).astype("Int64") + 1
+            return binned, list(edges)
         except Exception:
-            return [str(b) for b in range(1, bins+1)]
+            return pd.Series([1] * len(series), dtype="Int64"), [-np.inf, np.inf]
 
-    score_lbls = _qcut_labels(df["score"], n_bins)
-    pred_lbls  = _qcut_labels(df["pred"],  n_bins)
-    score_lmap = {b: score_lbls[i] for i, b in enumerate(score_bins)}
-    pred_lmap  = {b: pred_lbls[i]  for i, b in enumerate(pred_bins)}
+    score_binned, score_edges = _qcut_with_edges(df["score"], n_bins)
+    pred_binned,  pred_edges  = _qcut_with_edges(df["pred"],  n_bins)
+    df["score_bin"] = score_binned.values
+    df["pred_bin"]  = pred_binned.values
+
+    # 空值样本标记为 MISS_ID
+    df.loc[df["score"].isna(), "score_bin"] = MISS_ID
+    df.loc[df["pred"].isna(),  "pred_bin"]  = MISS_ID
+
+    score_bins_raw = sorted(df["score_bin"].dropna().unique())
+    pred_bins_raw  = sorted(df["pred_bin"].dropna().unique())
+
+    score_bins_normal = [b for b in score_bins_raw if b != MISS_ID]
+    pred_bins_normal  = [b for b in pred_bins_raw  if b != MISS_ID]
+    score_bins = score_bins_normal + ([MISS_ID] if MISS_ID in score_bins_raw else [])
+    pred_bins  = pred_bins_normal  + ([MISS_ID] if MISS_ID in pred_bins_raw  else [])
+
+    score_lbls = _edges_to_bin_labels(score_edges)
+    pred_lbls  = _edges_to_bin_labels(pred_edges)
+    score_lmap = {i + 1: lbl for i, lbl in enumerate(score_lbls)}
+    score_lmap[MISS_ID] = "Missing"
+    pred_lmap  = {i + 1: lbl for i, lbl in enumerate(pred_lbls)}
+    pred_lmap[MISS_ID]  = "Missing"
     pred_cols  = [pred_lmap.get(int(pb), str(pb)) for pb in pred_bins]
     col_label  = "score分箱\\预测分箱"
 
@@ -560,34 +776,110 @@ def _build_gain_matrix(y_label, y_pred, score, n_bins: int = 10):
     return pd.DataFrame(n_rows), pd.DataFrame(r_rows), pd.DataFrame(br_rows)
 
 
+def _write_gain_blocks_to_sheet(ws, gain_blocks: list) -> None:
+    """将增益矩阵块列表写入已创建的 worksheet，并对数据区施加条件格式。
+
+    gain_blocks 格式：[(title_str, blk_df), ...]
+    每 3 个块为一组（样本数矩阵、样本占比矩阵、坏账率矩阵），各组对应同一个数据集。
+    - 样本数 / 样本占比矩阵：ColorScale（白→蓝），每组独立范围
+    - 坏账率矩阵：DataBar（红色），每组独立范围
+    """
+    from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
+    from openpyxl.utils import get_column_letter
+
+    row_cursor = 1
+    # 记录每块写入的数据区 (min_row, max_row, min_col, max_col, block_type)
+    # block_type: 'n'=样本数, 'r'=样本占比, 'br'=坏账率
+    block_ranges = []
+
+    for i, (title, blk_df) in enumerate(gain_blocks):
+        if i > 0:
+            row_cursor += 1  # 空行
+        # 标题行
+        ws.cell(row=row_cursor, column=1, value=f"── {title} ──")
+        row_cursor += 1
+        # 列名行
+        for col_idx, col_name in enumerate(blk_df.columns, 1):
+            ws.cell(row=row_cursor, column=col_idx, value=col_name)
+        header_row = row_cursor
+        row_cursor += 1
+        # 数据行（不含末列"合计"的最后一行）
+        data_start_row = row_cursor
+        n_data_cols = len(blk_df.columns)
+        for _, data_row in blk_df.iterrows():
+            for col_idx, val in enumerate(data_row, 1):
+                ws.cell(row=row_cursor, column=col_idx, value=val)
+            row_cursor += 1
+        data_end_row = row_cursor - 1
+
+        # 判断块类型（根据 title 关键词）
+        if "坏账率" in title:
+            btype = "br"
+        elif "样本占比" in title:
+            btype = "r"
+        else:
+            btype = "n"
+
+        # 数据区：去掉第一列（行标签）和最后一行（合计行）及最后一列（合计列）
+        # 取数值区域 col 2 ~ n_data_cols-1，row data_start_row ~ data_end_row-1
+        if data_end_row > data_start_row and n_data_cols > 2:
+            block_ranges.append((data_start_row, data_end_row - 1,
+                                  2, n_data_cols - 1, btype))
+
+    # 应用条件格式
+    for (r1, r2, c1, c2, btype) in block_ranges:
+        if r2 < r1 or c2 < c1:
+            continue
+        range_str = f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}"
+        if btype == "br":
+            rule = DataBarRule(
+                start_type="num", start_value=0,
+                end_type="max",
+                color="FF0000",
+            )
+        else:
+            rule = ColorScaleRule(
+                start_type="min", start_color="FFFFFFFF",
+                end_type="max",   end_color="FF4472C4",
+            )
+        ws.conditional_formatting.add(range_str, rule)
+
+
 def _scorecard_table(score, label, n_bins: int = 10) -> pd.DataFrame:
     """标品模型分等频分箱分析，从低到高排列（第1箱分数最低）。
 
     列：分箱 | 分箱区间 | 样本数 | 样本占比 | 逾期数 | 逾期率 | Lift | 累计KS
-    末行追加 All 合计行。
+    score 为空的样本单独成 Missing 箱，追加在正常箱末尾、All 行之前。
+    末行追加 All 合计行（含 Missing 样本）。
     逾期率 = 逾期1样本数 / (0+1有效样本总和)
     Lift   = 箱内逾期率 / 全局逾期率
-    累计KS = |累计好样本率 - 累计坏样本率|（从低到高累计）
+    累计KS = |累计好样本率 - 累计坏样本率|（从低到高累计，仅正常箱参与）
     """
     arr_s = np.array(score)
     arr_l = np.array(label)
     total_n = len(arr_s)
 
-    # 全局逾期率（只用 0/1 有效样本）
-    valid_mask = (arr_l == 0) | (arr_l == 1)
-    total_bad  = int(arr_l[valid_mask].sum())
-    total_good = int((arr_l[valid_mask] == 0).sum())
-    total_valid = total_bad + total_good
+    df = pd.DataFrame({"score": arr_s, "label": arr_l})
+
+    # 分离 Missing 样本（score 为空）
+    miss_mask  = df["score"].isna()
+    df_valid   = df[~miss_mask].copy()
+    df_miss    = df[miss_mask].copy()
+
+    # 全局逾期率（只用 0/1 有效样本，含 Missing 样本）
+    valid_mask   = (arr_l == 0) | (arr_l == 1)
+    total_bad    = int(arr_l[valid_mask].sum())
+    total_good   = int((arr_l[valid_mask] == 0).sum())
+    total_valid  = total_bad + total_good
     overall_bad_rate = total_bad / total_valid if total_valid > 0 else 0
 
-    df = pd.DataFrame({"score": arr_s, "label": arr_l})
     try:
-        df["bin"] = pd.qcut(df["score"], q=n_bins, duplicates="drop", labels=False) + 1
+        df_valid["bin"] = pd.qcut(df_valid["score"], q=n_bins, duplicates="drop", labels=False) + 1
     except Exception:
-        df["bin"] = 1
+        df_valid["bin"] = 1
 
     rows = []
-    for bin_id, g in df.groupby("bin", sort=True):
+    for bin_id, g in df_valid.groupby("bin", sort=True):
         n      = len(g)
         vm     = (g["label"] == 0) | (g["label"] == 1)
         bad    = int(g.loc[vm, "label"].sum())
@@ -596,13 +888,13 @@ def _scorecard_table(score, label, n_bins: int = 10) -> pd.DataFrame:
         br     = bad / valid if valid > 0 else None
         lift   = round(br / overall_bad_rate, 4) if (br is not None and overall_bad_rate > 0) else None
         rows.append({
-            "分箱":   int(bin_id),
-            "样本数": n,
+            "分箱":     int(bin_id),
+            "样本数":   n,
             "样本占比": round(n / total_n, 4),
-            "逾期数": bad,
+            "逾期数":   bad,
             "好样本数": good,
-            "逾期率": round(br, 4) if br is not None else None,
-            "Lift":  lift,
+            "逾期率":   round(br, 4) if br is not None else None,
+            "Lift":     lift,
         })
 
     if not rows:
@@ -612,74 +904,83 @@ def _scorecard_table(score, label, n_bins: int = 10) -> pd.DataFrame:
 
     # 分箱区间
     grp.insert(1, "分箱区间", _make_bin_labels(
-        df.groupby("bin", sort=True)["score"].min().tolist(),
-        df.groupby("bin", sort=True)["score"].max().tolist(),
+        df_valid.groupby("bin", sort=True)["score"].min().tolist(),
+        df_valid.groupby("bin", sort=True)["score"].max().tolist(),
     ))
 
-    # 累计KS（从低到高）
-    cum_bad  = grp["逾期数"].cumsum()
-    cum_good = grp["好样本数"].cumsum()
+    # 累计KS（从低到高，仅正常箱）
+    cum_bad       = grp["逾期数"].cumsum()
+    cum_good      = grp["好样本数"].cumsum()
     cum_bad_rate  = cum_bad  / total_bad  if total_bad  > 0 else cum_bad  * 0
     cum_good_rate = cum_good / total_good if total_good > 0 else cum_good * 0
     grp["累计KS"] = (cum_bad_rate - cum_good_rate).abs().round(4)
 
-    # All 合计行
-    all_br   = total_bad / total_valid if total_valid > 0 else None
-    all_row  = {
+    # Missing 箱（score 为空）
+    if not df_miss.empty:
+        mn   = len(df_miss)
+        mvm  = (df_miss["label"] == 0) | (df_miss["label"] == 1)
+        mbad = int(df_miss.loc[mvm, "label"].sum())
+        mgood= int((df_miss.loc[mvm, "label"] == 0).sum())
+        mvld = mbad + mgood
+        mbr  = mbad / mvld if mvld > 0 else None
+        mlift= round(mbr / overall_bad_rate, 4) if (mbr is not None and overall_bad_rate > 0) else None
+        miss_row = {
+            "分箱":     "Missing",
+            "分箱区间": "Missing",
+            "样本数":   mn,
+            "样本占比": round(mn / total_n, 4),
+            "逾期数":   mbad,
+            "好样本数": mgood,
+            "逾期率":   round(mbr, 4) if mbr is not None else None,
+            "Lift":     mlift,
+            "累计KS":   None,
+        }
+        grp = pd.concat([grp, pd.DataFrame([miss_row])], ignore_index=True)
+
+    # All 合计行（含 Missing 样本）
+    s_valid = df_valid["score"]
+    all_br  = total_bad / total_valid if total_valid > 0 else None
+    all_row = {
         "分箱":     "All",
-        "分箱区间": f"[{arr_s.min()}, {arr_s.max()}]",
+        "分箱区间": f"[{s_valid.min()}, {s_valid.max()}]" if not s_valid.empty else "N/A",
         "样本数":   total_n,
         "样本占比": 1.0,
         "逾期数":   total_bad,
         "好样本数": total_good,
         "逾期率":   round(all_br, 4) if all_br is not None else None,
         "Lift":     1.0,
-        "累计KS":   grp["累计KS"].max(),
+        "累计KS":   grp["累计KS"].dropna().max() if grp["累计KS"].notna().any() else None,
     }
     grp = pd.concat([grp, pd.DataFrame([all_row])], ignore_index=True)
     grp = grp.drop(columns=["好样本数"])
     return grp
 
 
-def _monthly_stats(y_true, y_pred, months, true_edges, pred_edges, labels=None) -> pd.DataFrame:
-    """按月计算每月的 MAE、MAPE、样本数及真实值/预测值各桶样本数和占比。
-    返回每行一个月份的宽表，列包括：
-      月份 | 样本数 | MAE | MAPE(%) | 真实值_桶1_n | 真实值_桶1_占比 | ... | 预测值_桶1_n | ...
-    """
-    true_bin_labels = _edges_to_bin_labels(true_edges)
-    pred_bin_labels = _edges_to_bin_labels(pred_edges)
-    n_true_bins = len(true_bin_labels)
-    n_pred_bins = len(pred_bin_labels)
+def _monthly_stats(y_true, y_pred, months, true_edges, pred_edges,
+                   labels=None, total_n_all: int = None) -> pd.DataFrame:
+    """按月计算每月的 MAE、MAPE、样本数、当月占比、逾期率。
 
+    total_n_all: 全量总样本数（不限 dataset），用于计算当月占比；
+                 不传则用当前集合自身总样本数。
+    """
     df = pd.DataFrame({"y": np.array(y_true), "p": np.array(y_pred), "month": np.array(months)})
     if labels is not None:
         df["_label"] = np.array(labels)
-    df["真实桶"] = pd.cut(df["y"], bins=true_edges, labels=False, include_lowest=True).astype("Int64") + 1
-    df["预测桶"] = pd.cut(df["p"], bins=pred_edges, labels=False, include_lowest=True).astype("Int64") + 1
+
+    total_base = total_n_all if total_n_all is not None else len(df)
 
     rows = []
     for month_val, g in df.groupby("month", sort=True):
         n = len(g)
         row = {
-            "月份": month_val,
-            "样本数": n,
-            "MAE": round(float(mean_absolute_error(g["y"].values, g["p"].values)), 4),
-            "MAPE(%)": _mape(g["y"].values, g["p"].values),
+            "月份":     month_val,
+            "样本数":   n,
+            "当月占比": round(n / total_base, 4) if total_base > 0 else None,
+            "MAE":      round(float(mean_absolute_error(g["y"].values, g["p"].values)), 4),
+            "MAPE(%)":  _mape(g["y"].values, g["p"].values),
         }
         if labels is not None:
-            row["1值占比"] = _label_rate(g["_label"].values)
-        # 真实值各桶分布
-        for bi in range(1, n_true_bins + 1):
-            lbl = true_bin_labels[bi - 1]
-            cnt = int((g["真实桶"] == bi).sum())
-            row[f"真实值_{lbl}_n"]   = cnt
-            row[f"真实值_{lbl}_占比"] = round(cnt / n, 4) if n else 0
-        # 预测值各桶分布
-        for bi in range(1, n_pred_bins + 1):
-            lbl = pred_bin_labels[bi - 1]
-            cnt = int((g["预测桶"] == bi).sum())
-            row[f"预测值_{lbl}_n"]   = cnt
-            row[f"预测值_{lbl}_占比"] = round(cnt / n, 4) if n else 0
+            row["逾期率"] = _label_rate(g["_label"].values)
         rows.append(row)
 
     return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -822,16 +1123,9 @@ class ReportGenerator:
             if month_bin_all:
                 sheets["按月分箱"] = pd.concat(month_bin_all, ignore_index=True)
 
-        # 增益矩阵（可选）
+        # 增益矩阵（可选）—— 存为 [(title, df), ...] 列表，写 Excel 时逐块手动控制行
+        gain_blocks_clf = []  # [(title_str, df), ...]
         if gain_score_data:
-            def _section_header_clf(title, cols):
-                row = {c: "" for c in cols}
-                row[cols[0]] = f"── {title} ──"
-                return pd.DataFrame([row])
-            def _blank_row_clf(cols):
-                return pd.DataFrame([{c: "" for c in cols}])
-
-            gain_parts = []
             for name, (score, g_label) in gain_score_data.items():
                 if name not in datasets:
                     continue
@@ -839,18 +1133,10 @@ class ReportGenerator:
                 n_df_g, ratio_df_g, br_df_g = _build_gain_matrix(
                     np.array(g_label), y_score_gain, np.array(score)
                 )
-                if gain_parts:
-                    gain_parts.append(_blank_row_clf(n_df_g.columns.tolist()))
-                gain_parts.append(_section_header_clf(f"{name} — 样本数矩阵（行=score分箱，列=预测分分箱）", n_df_g.columns.tolist()))
-                gain_parts.append(n_df_g)
-                gain_parts.append(_blank_row_clf(ratio_df_g.columns.tolist()))
-                gain_parts.append(_section_header_clf(f"{name} — 样本占比矩阵", ratio_df_g.columns.tolist()))
-                gain_parts.append(ratio_df_g)
-                gain_parts.append(_blank_row_clf(br_df_g.columns.tolist()))
-                gain_parts.append(_section_header_clf(f"{name} — 坏账率矩阵", br_df_g.columns.tolist()))
-                gain_parts.append(br_df_g)
-            if gain_parts:
-                sheets["增益矩阵"] = pd.concat(gain_parts, ignore_index=True)
+                gain_blocks_clf.append((f"{name} — 样本数矩阵（行=score分箱，列=预测分分箱）", n_df_g))
+                gain_blocks_clf.append((f"{name} — 样本占比矩阵", ratio_df_g))
+                gain_blocks_clf.append((f"{name} — 坏账率矩阵", br_df_g))
+
 
         # 标品模型分分析（可选）
         # 标品模型分分析（可选）
@@ -901,6 +1187,10 @@ class ReportGenerator:
             fi_df = _build_feature_importance_df(feature_importance)
             if fi_df is not None:
                 fi_df.to_excel(writer, sheet_name="特征重要性", index=False)
+            # 增益矩阵：逐块写入，每块标题行 + 列名行 + 数据行，不写顶层 header
+            if gain_blocks_clf:
+                ws = writer.book.create_sheet("增益矩阵")
+                _write_gain_blocks_to_sheet(ws, gain_blocks_clf)
 
         html = self._build_clf_html(summary_df, sheets, filename)
         with open(html_path, "w", encoding="utf-8") as f:
@@ -954,6 +1244,11 @@ class ReportGenerator:
         true_edges = _get_cut_edges(np.array(first_vals[0]), n_bins,      bins)
         pred_edges = _get_cut_edges(np.array(first_vals[1]), n_bins_pred, bins_pred)
 
+        # display_edges：头尾保留 ±inf（标签显示为 -inf/+inf，明确开放边界），
+        # 中间切点直接用 _get_cut_edges 计算的训练集 qcut 值，三集合共用同一套标签
+        display_true_edges = list(true_edges)
+        display_pred_edges = list(pred_edges)
+
         merged_true_rows = []
         merged_pred_rows = []
         merged_matrix_rows = []
@@ -975,16 +1270,20 @@ class ReportGenerator:
                 "Spearman_p值":     round(float(spearman_p), 4),
                 "样本量": len(y_true),
             })
-            bdf_t = _bucket_table(y_true, y_pred, by="true", cut_edges=true_edges, labels=lbl)
+            bdf_t = _bucket_table(y_true, y_pred, by="true", cut_edges=true_edges, labels=lbl,
+                                  display_edges=display_true_edges)
             bdf_t.insert(0, "数据集", name)
             merged_true_rows.append(bdf_t)
 
-            bdf_p = _bucket_table(y_true, y_pred, by="pred", cut_edges=pred_edges, labels=lbl)
+            bdf_p = _bucket_table(y_true, y_pred, by="pred", cut_edges=pred_edges, labels=lbl,
+                                  display_edges=display_pred_edges)
             bdf_p.insert(0, "数据集", name)
             merged_pred_rows.append(bdf_p)
 
             merged_matrix_rows.append((name, _build_cross_matrix(
-                y_true, y_pred, true_edges, pred_edges, labels=lbl)))
+                y_true, y_pred, true_edges, pred_edges, labels=lbl,
+                display_true_edges=display_true_edges,
+                display_pred_edges=display_pred_edges)))
 
         # 三张 sheet：真实值分桶、预测值分桶、分桶矩阵，各自合并三集合
         def _section_header(title: str, cols: list) -> pd.DataFrame:
@@ -1033,8 +1332,9 @@ class ReportGenerator:
                     continue
                 gain_score_data[ds_name] = (sub[gain_score_col].values, sub[gain_label_col].values)
 
+        # 增益矩阵（可选）—— 存为 [(title, df), ...] 列表，写 Excel 时逐块手动控制行
+        gain_blocks_reg = []
         if gain_score_data:
-            gain_parts = []
             for name, (score, g_label) in gain_score_data.items():
                 if name not in datasets:
                     continue
@@ -1042,18 +1342,9 @@ class ReportGenerator:
                 n_df_g, ratio_df_g, br_df_g = _build_gain_matrix(
                     np.array(g_label), y_pred_gain, np.array(score)
                 )
-                if gain_parts:
-                    gain_parts.append(_blank_row(n_df_g.columns.tolist()))
-                gain_parts.append(_section_header(f"{name} — 样本数矩阵（行=score分箱，列=预测分分箱）", n_df_g.columns.tolist()))
-                gain_parts.append(n_df_g)
-                gain_parts.append(_blank_row(ratio_df_g.columns.tolist()))
-                gain_parts.append(_section_header(f"{name} — 样本占比矩阵", ratio_df_g.columns.tolist()))
-                gain_parts.append(ratio_df_g)
-                gain_parts.append(_blank_row(br_df_g.columns.tolist()))
-                gain_parts.append(_section_header(f"{name} — 坏账率矩阵", br_df_g.columns.tolist()))
-                gain_parts.append(br_df_g)
-            if gain_parts:
-                sheets["增益矩阵"] = pd.concat(gain_parts, ignore_index=True)
+                gain_blocks_reg.append((f"{name} — 样本数矩阵（行=score分箱，列=预测分分箱）", n_df_g))
+                gain_blocks_reg.append((f"{name} — 样本占比矩阵", ratio_df_g))
+                gain_blocks_reg.append((f"{name} — 坏账率矩阵", br_df_g))
 
         # 标品模型分分析（可选）
         # 优先从 raw_df 按列名构建
@@ -1092,6 +1383,8 @@ class ReportGenerator:
 
         # 按月分桶 sheet + 按月评估（合并三集合）
         monthly_summary_rows = []
+        # 全量总样本数（所有 dataset 合并），用于按月占比分母
+        total_n_all = sum(len(np.array(v[0])) for v in datasets.values())
         if month_col_data:
             for name, mdf in month_col_data.items():
                 if name not in datasets:
@@ -1112,6 +1405,7 @@ class ReportGenerator:
                     y_true_all, y_pred_all, mdf[month_col].values,
                     true_edges, pred_edges,
                     labels=lbl_all,
+                    total_n_all=total_n_all,
                 )
                 if not ms_df.empty:
                     ms_df.insert(0, "数据集", name)
@@ -1131,6 +1425,10 @@ class ReportGenerator:
             fi_df = _build_feature_importance_df(feature_importance)
             if fi_df is not None:
                 fi_df.to_excel(writer, sheet_name="特征重要性", index=False)
+            # 增益矩阵：逐块写入，每块标题行 + 列名行 + 数据行
+            if gain_blocks_reg:
+                ws = writer.book.create_sheet("增益矩阵")
+                _write_gain_blocks_to_sheet(ws, gain_blocks_reg)
             # 特征箱线图 sheet
             if feature_importance is not None and raw_df is not None and target_col is not None:
                 _write_feature_binplot_sheet(
@@ -1363,36 +1661,25 @@ class ReportGenerator:
                 import matplotlib
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
+                import matplotlib.font_manager as _fma
+                import numpy as _np
                 from io import BytesIO
                 from openpyxl.drawing.image import Image as XLImage
 
-                dataset_map = {"train": "训练集", "test": "验证集", "oot": "OOT"}
-                present_datasets = [
-                    d for d in ["train", "test", "oot"]
-                    if d in df[dataset_col].unique()
+                # 中文字体（Linux/Windows 兼容）
+                _CN_CANDS = [
+                    "Microsoft YaHei", "SimHei", "SimSun",
+                    "Noto Sans SC", "Noto Sans CJK SC", "Noto Sans CJK JP",
+                    "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",
+                    "AR PL UMing CN", "DejaVu Sans",
                 ]
-
-                wb = writer.book
-                ws = wb.create_sheet("特征分箱图")
-
-                import matplotlib
-                matplotlib.use("Agg")
-                import matplotlib.pyplot as plt
-                import matplotlib.font_manager as _fm
-                from io import BytesIO
-                from openpyxl.drawing.image import Image as XLImage
-
-                # 中文字体
-                _cn_font = None
-                for _fn in ["Microsoft YaHei", "SimHei", "Noto Sans SC", "SimSun"]:
-                    if any(f.name == _fn for f in _fm.fontManager.ttflist):
-                        _cn_font = _fn
-                        break
+                _avail = {f.name for f in _fma.fontManager.ttflist}
+                _cn_font = next((fn for fn in _CN_CANDS if fn in _avail), None)
                 if _cn_font:
                     plt.rcParams["font.family"] = _cn_font
                 plt.rcParams["axes.unicode_minus"] = False
 
-                dataset_map = {"train": "训练集", "test": "验证集", "oot": "OOT"}
+                dataset_map = {"train": "Train", "test": "Test", "oot": "OOT"}
                 present_datasets = [
                     d for d in ["train", "test", "oot"]
                     if d in df[dataset_col].unique()
@@ -1401,11 +1688,12 @@ class ReportGenerator:
                 wb = writer.book
                 ws = wb.create_sheet("特征分箱图")
 
-                # 第1列写特征名，图从第2列开始，每张图占 15行 x 8列
-                row_height = 15
-                col_width  = 8
-                name_col   = 1   # 特征名文字列
-                img_start_col = 2  # 图起始列
+                IMG_W = 360
+                IMG_H = 260
+                row_height    = int(IMG_H / 0.75 / 20) + 1  # Excel 行高单位
+                col_width_img = int(IMG_W / 7) + 1
+                name_col      = 1
+                img_start_col = 2
 
                 for feat_idx, feat in enumerate(features):
                     try:
@@ -1418,41 +1706,111 @@ class ReportGenerator:
                     df_work["__bin__"] = binned.values
 
                     anchor_row = feat_idx * row_height + 1
-
-                    # 特征名写在第1列
                     ws.cell(row=anchor_row, column=name_col, value=feat)
+
+                    # 预计算全局 y 轴范围，保证同一特征三图可直接对比
+                    all_means_g = []
+                    ds_agg_cache_fa = {}
+                    for ds_key in present_datasets:
+                        subset_all = df_work[df_work[dataset_col] == ds_key].copy()
+                        subset     = subset_all.dropna(subset=[feat])
+                        total_ds   = len(subset)
+                        agg_fa = subset.groupby("__bin__", observed=True).agg(
+                            mean_val=(target_col, "mean"),
+                            count_val=(target_col, "count"),
+                        ).reindex(binned.cat.categories)
+                        means_fa  = agg_fa["mean_val"].values
+                        counts_fa = agg_fa["count_val"].fillna(0).values
+                        pcts_fa   = counts_fa / len(subset_all) if len(subset_all) > 0 else counts_fa * 0
+
+                        # Missing 箱
+                        sub_miss_fa  = subset_all[subset_all[feat].isna()]
+                        miss_mean_fa = float(sub_miss_fa[target_col].mean()) if not sub_miss_fa.empty else _np.nan
+                        miss_n_fa    = len(sub_miss_fa)
+                        miss_pct_fa  = miss_n_fa / len(subset_all) if len(subset_all) > 0 else 0.0
+
+                        # 整体均值（含 Missing 样本，用于伪Lift）
+                        ds_overall_mean_fa = float(subset_all[target_col].mean()) if not subset_all.empty else _np.nan
+
+                        ds_agg_cache_fa[ds_key] = (means_fa, counts_fa, pcts_fa,
+                                                   miss_mean_fa, miss_n_fa, miss_pct_fa,
+                                                   ds_overall_mean_fa)
+                        all_means_g.extend([v for v in means_fa if not _np.isnan(v)])
+                        if not _np.isnan(miss_mean_fa):
+                            all_means_g.append(miss_mean_fa)
+
+                    if not all_means_g:
+                        continue
+                    g_ymin_fa = float(_np.min(all_means_g))
+                    g_ymax_fa = float(_np.max(all_means_g))
+                    g_pad_fa  = (g_ymax_fa - g_ymin_fa) * 0.2 if (g_ymax_fa - g_ymin_fa) > 0 else abs(g_ymax_fa) * 0.25 + 0.1
+                    y_lo_fa   = g_ymin_fa - g_pad_fa * 0.3
+                    y_hi_fa   = g_ymax_fa + g_pad_fa
 
                     for ds_idx, ds_key in enumerate(present_datasets):
                         ds_label = dataset_map[ds_key]
-                        subset = df_work[df_work[dataset_col] == ds_key]
+                        means, counts, pcts, miss_mean_fa, miss_n_fa, miss_pct_fa, ds_overall_mean_fa = ds_agg_cache_fa[ds_key]
 
-                        means = (
-                            subset.groupby("__bin__", observed=True)[target_col]
-                            .mean()
-                            .reindex(binned.cat.categories)
-                        )
+                        has_miss_fa = miss_n_fa > 0 and not _np.isnan(miss_mean_fa)
+                        all_bin_lbls = bin_labels + (["Missing"] if has_miss_fa else [])
+                        all_means_p  = _np.append(means, miss_mean_fa if has_miss_fa else _np.nan)
+                        all_pcts_p   = _np.append(pcts,  miss_pct_fa  if has_miss_fa else _np.nan)
+                        x = _np.arange(len(all_bin_lbls))
 
-                        fig, ax = plt.subplots(figsize=(4.2, 3.0))
-                        ax.bar(range(len(means)), means.values)
-                        ax.set_xticks(range(len(bin_labels)))
-                        ax.set_xticklabels(bin_labels, rotation=45, ha="right", fontsize=7)
-                        ax.set_title(ds_label, fontsize=9)
-                        ax.set_ylabel(f"{target_col} 均值", fontsize=8)
-                        ax.set_xlabel(feat, fontsize=8)
+                        fig, ax = plt.subplots(figsize=(IMG_W / 96, IMG_H / 96))
+
+                        bar_colors_fa = ["#4C72B0"] * len(means) + (["#B0784C"] if has_miss_fa else [])
+                        bars = ax.bar(x, all_means_p, color=bar_colors_fa, edgecolor="white",
+                                      alpha=0.85, zorder=2)
+                        # 折线（仅正常箱）
+                        valid = ~_np.isnan(means)
+                        vx = _np.arange(len(means))
+                        if valid.sum() > 1:
+                            ax.plot(vx[valid], means[valid], color="#E84646",
+                                    linewidth=1.2, marker="o", markersize=3, zorder=3)
+
+                        # 柱顶双行标注：均值 + 伪Lift（所有箱均标注）
+                        offset = g_pad_fa * 0.12
+                        for xi, mv in zip(x, all_means_p):
+                            if _np.isnan(mv):
+                                continue
+                            if _np.isnan(ds_overall_mean_fa) or ds_overall_mean_fa == 0:
+                                label_str = f"{mv:.3f}"
+                            else:
+                                label_str = f"{mv:.3f}\n×{mv / ds_overall_mean_fa:.2f}"
+                            ax.text(xi, mv + offset, label_str,
+                                    ha="center", va="bottom", fontsize=5,
+                                    color="#222222", zorder=4, linespacing=1.3)
+
+                        # 占比标注（柱内）
+                        for xi, (bar, pv, mv) in enumerate(zip(bars, all_pcts_p, all_means_p)):
+                            if _np.isnan(mv) or bar.get_height() == 0:
+                                continue
+                            bar_mid = bar.get_y() + bar.get_height() / 2
+                            ax.text(xi, bar_mid, f"{pv:.1%}",
+                                    ha="center", va="center", fontsize=5,
+                                    color="white", fontweight="bold", zorder=4)
+
+                        ax.set_xticks(x)
+                        ax.set_xticklabels(all_bin_lbls, rotation=45, ha="right", fontsize=5.5)
+                        ax.set_title(f"{feat} - {ds_label}", fontsize=7, pad=3)
+                        ax.tick_params(axis="y", labelsize=6)
+                        ax.set_ylabel("Mean", fontsize=6)
+                        ax.margins(x=0.05)
+                        ax.set_ylim(y_lo_fa, y_hi_fa)
                         fig.tight_layout()
 
                         buf = BytesIO()
-                        fig.savefig(buf, format="png", dpi=96)
+                        fig.savefig(buf, format="png", dpi=110)
                         plt.close(fig)
                         buf.seek(0)
 
                         img = XLImage(buf)
-                        img.width  = 300
-                        img.height = 220
+                        img.width  = IMG_W
+                        img.height = IMG_H
 
-                        anchor_col = img_start_col + ds_idx * col_width
-                        cell = ws.cell(row=anchor_row, column=anchor_col)
-                        ws.add_image(img, cell.coordinate)
+                        anchor_col = img_start_col + ds_idx * col_width_img
+                        ws.add_image(img, ws.cell(row=anchor_row, column=anchor_col).coordinate)
 
         return excel_path
 
@@ -1524,22 +1882,52 @@ class ReportGenerator:
                     sub = df[df[dataset_col] == ds][[feat, target]].copy()
                     if sub.empty:
                         continue
-                    sub["_bin"] = pd.cut(sub[feat], bins=edges, include_lowest=True)
-                    total_n = len(sub)
+                    total_n   = len(sub)
                     total_bad = int(sub[target].sum())
+
+                    # 正常箱
+                    sub_valid = sub.dropna(subset=[feat]).copy()
+                    sub_valid["_bin"] = pd.cut(sub_valid[feat], bins=edges, include_lowest=True)
                     grp_rows = []
-                    for bin_label, g in sub.groupby("_bin"):
+                    for bin_label, g in sub_valid.groupby("_bin"):
                         n   = len(g)
                         bad = int(g[target].sum())
                         grp_rows.append({
-                            "dataset": ds,
-                            "分箱区间": str(bin_label),
-                            "样本数": n,
-                            "样本占比": round(n / total_n, 4) if total_n > 0 else None,
-                            "坏样本数": bad,
-                            "坏样本率": round(bad / n, 4) if n > 0 else None,
+                            "dataset":     ds,
+                            "分箱区间":    str(bin_label),
+                            "样本数":      n,
+                            "样本占比":    round(n / total_n, 4) if total_n > 0 else None,
+                            "坏样本数":    bad,
+                            "坏样本率":    round(bad / n, 4) if n > 0 else None,
                             "坏样本在全集占比": round(bad / total_bad, 4) if total_bad > 0 else None,
                         })
+
+                    # Missing 箱（特征值为空）
+                    sub_miss = sub[sub[feat].isna()]
+                    if not sub_miss.empty:
+                        mn   = len(sub_miss)
+                        mbad = int(sub_miss[target].sum())
+                        grp_rows.append({
+                            "dataset":     ds,
+                            "分箱区间":    "Missing",
+                            "样本数":      mn,
+                            "样本占比":    round(mn / total_n, 4) if total_n > 0 else None,
+                            "坏样本数":    mbad,
+                            "坏样本率":    round(mbad / mn, 4) if mn > 0 else None,
+                            "坏样本在全集占比": round(mbad / total_bad, 4) if total_bad > 0 else None,
+                        })
+
+                    # All 合计行（含 Missing 样本）
+                    grp_rows.append({
+                        "dataset":     ds,
+                        "分箱区间":    "All",
+                        "样本数":      total_n,
+                        "样本占比":    1.0,
+                        "坏样本数":    total_bad,
+                        "坏样本率":    round(total_bad / total_n, 4) if total_n > 0 else None,
+                        "坏样本在全集占比": 1.0 if total_bad > 0 else None,
+                    })
+
                     all_rows.extend(grp_rows)
 
                 if all_rows:

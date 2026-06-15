@@ -13,14 +13,15 @@ class Binning:
         self.iv_summary: pd.DataFrame = pd.DataFrame()
 
     def fit(self, df: pd.DataFrame, target: str, cols: Optional[list] = None) -> "Binning":
-        """拟合分箱边界和 WOE/IV，target 为0/1二分类标签列"""
+        """拟合分箱边界和 WOE/IV，target 为0/1二分类标签列；空值样本单独成 Missing 箱参与 IV 汇总"""
         cols = cols or [c for c in df.columns if c != target]
         total_bad = (df[target] == 1).sum()
         total_good = (df[target] == 0).sum()
 
         iv_rows = []
         for col in cols:
-            sub = df[[col, target]].dropna(subset=[col])
+            sub_all = df[[col, target]].copy()
+            sub = sub_all.dropna(subset=[col])
             if sub.empty or sub[col].nunique() < 2:
                 continue
             try:
@@ -40,10 +41,39 @@ class Binning:
             grp["好样本占比"] = (grp["好样本数"] / total_good).clip(lower=1e-6)
             grp["WOE"] = np.log(grp["坏样本占比"] / grp["好样本占比"]).round(4)
             grp["IV_bin"] = ((grp["坏样本占比"] - grp["好样本占比"]) * grp["WOE"]).round(6)
-            self._woe_map[col] = grp["WOE"].to_dict()
+            woe_dict = grp["WOE"].to_dict()
+
+            # Missing 箱：空值样本单独统计，参与 WOE/IV 计算
+            miss_sub = sub_all[sub_all[col].isna()]
+            if not miss_sub.empty:
+                miss_bad  = int((miss_sub[target] == 1).sum())
+                miss_good = int((miss_sub[target] == 0).sum())
+                miss_n    = len(miss_sub)
+                miss_bad_rate  = max(miss_bad  / total_bad,  1e-6) if total_bad  > 0 else 1e-6
+                miss_good_rate = max(miss_good / total_good, 1e-6) if total_good > 0 else 1e-6
+                miss_woe = round(float(np.log(miss_bad_rate / miss_good_rate)), 4)
+                miss_iv  = round(float((miss_bad_rate - miss_good_rate) * miss_woe), 6)
+                woe_dict["Missing"] = miss_woe
+                miss_row = pd.DataFrame([{
+                    "_bin":    "Missing",
+                    "坏样本数":  miss_bad,
+                    "总样本数":  miss_n,
+                    "好样本数":  miss_good,
+                    "坏样本占比": round(miss_bad_rate, 6),
+                    "好样本占比": round(miss_good_rate, 6),
+                    "WOE":     miss_woe,
+                    "IV_bin":  miss_iv,
+                }])
+                grp.index = grp.index.astype(str)
+                grp = grp.reset_index()
+                grp = pd.concat([grp, miss_row], ignore_index=True)
+                grp = grp.set_index("_bin")
+            else:
+                grp.index = grp.index.astype(str)
+
+            self._woe_map[col] = woe_dict
 
             iv_total = round(grp["IV_bin"].sum(), 4)
-            grp.index = grp.index.astype(str)
             iv_rows.append({"特征名": col, "IV": iv_total, "分箱详情": grp.reset_index().rename(columns={"_bin": "分箱区间"})})
 
         self.iv_summary = pd.DataFrame([{"特征名": r["特征名"], "IV": r["IV"]} for r in iv_rows])
@@ -51,20 +81,26 @@ class Binning:
         return self
 
     def transform(self, df: pd.DataFrame, cols: Optional[list] = None, mode: str = "bin_index") -> pd.DataFrame:
-        """将特征转换为分箱编号(mode='bin_index')或 WOE 值(mode='woe')"""
+        """将特征转换为分箱编号(mode='bin_index')或 WOE 值(mode='woe')；空值映射到 Missing 箱"""
         out = df.copy()
         cols = cols or list(self._bin_edges.keys())
         for col in cols:
             if col not in self._bin_edges:
                 continue
             edges = self._bin_edges[col]
-            binned = pd.cut(out[col], bins=edges, include_lowest=True, labels=False)
+            null_mask = out[col].isna()
             if mode == "woe":
                 bin_labels = pd.cut(out[col], bins=edges, include_lowest=True)
                 woe_map = self._woe_map.get(col, {})
                 out[col] = bin_labels.map(woe_map)
+                if null_mask.any():
+                    miss_woe = woe_map.get("Missing", np.nan)
+                    out.loc[null_mask, col] = miss_woe
             else:
+                binned = pd.cut(out[col], bins=edges, include_lowest=True, labels=False)
                 out[col] = binned
+                if null_mask.any():
+                    out.loc[null_mask, col] = -1
         return out
 
     def fit_transform(self, df: pd.DataFrame, target: str, cols: Optional[list] = None, mode: str = "bin_index") -> pd.DataFrame:
