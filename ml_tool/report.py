@@ -143,8 +143,8 @@ def _write_feature_binplot_sheet(
     else:
         ws = workbook.create_sheet(title=sheet_name)
 
-    IMG_W_PX = 360
-    IMG_H_PX = 260
+    IMG_W_PX = 480
+    IMG_H_PX = 320
     COL_W    = IMG_W_PX / 7
     ROW_H    = IMG_H_PX / 0.75
 
@@ -219,8 +219,8 @@ def _write_feature_binplot_sheet(
             continue
         g_ymin = float(np.min(all_means_global))
         g_ymax = float(np.max(all_means_global))
-        g_pad  = (g_ymax - g_ymin) * 0.18 if (g_ymax - g_ymin) > 0 else abs(g_ymax) * 0.2 + 0.1
-        y_lo, y_hi = g_ymin - g_pad * 0.3, g_ymax + g_pad
+        g_pad  = (g_ymax - g_ymin) * 0.35 if (g_ymax - g_ymin) > 0 else abs(g_ymax) * 0.35 + 0.05
+        y_lo, y_hi = g_ymin - g_pad * 0.15, g_ymax + g_pad
 
         for col_idx, (ds_key, ds_label) in enumerate(DATASET_ORDER):
             if ds_key not in ds_agg_cache:
@@ -235,49 +235,63 @@ def _write_feature_binplot_sheet(
             n_bars   = len(bin_strs)
             x        = np.arange(n_bars)
 
-            fig, ax = plt.subplots(figsize=(IMG_W_PX / 96, IMG_H_PX / 96))
+            fig, ax_bar = plt.subplots(figsize=(IMG_W_PX / 96, IMG_H_PX / 96))
+            ax_line = ax_bar.twinx()
 
+            # 柱子：高度 = 样本占比，左轴
             bar_colors = ["#4C72B0"] * len(agg) + (["#B0784C"] if has_miss else [])
-            bars = ax.bar(x, means, color=bar_colors, edgecolor="white", alpha=0.85, zorder=2)
+            ax_bar.bar(x, pcts, color=bar_colors, edgecolor="white", alpha=0.75, zorder=2)
+            ax_bar.set_ylim(0, max(pcts.max() * 2.2, 0.1))
+            ax_bar.set_ylabel("Pct", fontsize=6, color="#4C72B0")
+            ax_bar.tick_params(axis="y", labelsize=5, colors="#4C72B0")
 
-            # 折线：仅连接正常箱（不含 Missing）
+            # 折线：高度 = 均值，右轴，使用全局统一范围
             valid_x = np.arange(len(agg))
             valid_m = agg["mean_target"].values
             valid_mask_plot = ~np.isnan(valid_m)
             if valid_mask_plot.sum() > 1:
-                ax.plot(valid_x[valid_mask_plot], valid_m[valid_mask_plot],
-                        color="#E84646", linewidth=1.2, marker="o", markersize=3, zorder=3)
+                ax_line.plot(valid_x[valid_mask_plot], valid_m[valid_mask_plot],
+                             color="#E84646", linewidth=1.2, marker="o", markersize=3, zorder=3)
+            if has_miss and not np.isnan(miss_mean):
+                ax_line.plot(len(agg) - 1 + 1, miss_mean,
+                             marker="o", markersize=3, color="#B0784C", alpha=0.5, zorder=3)
+            ax_line.set_ylim(y_lo, y_hi)
+            ax_line.set_ylabel("Mean", fontsize=6, color="#E84646")
+            ax_line.tick_params(axis="y", labelsize=5, colors="#E84646")
 
-            # 柱子顶部双行标注：均值 + 伪Lift（所有箱均标注）
-            offset        = g_pad * 0.12
-            for xi, mv in zip(x, means):
+            # 占比标注：柱顶上方，不依赖柱高
+            pct_pad = ax_bar.get_ylim()[1] * 0.02
+            for xi, pv in enumerate(pcts):
+                if np.isnan(pv) or pv == 0:
+                    continue
+                ax_bar.text(xi, pcts[xi] + pct_pad, f"{pv:.1%}",
+                            ha="center", va="bottom", fontsize=5,
+                            color="#333333", zorder=4)
+
+            # 整体均值参考线（右轴坐标）
+            if not np.isnan(ds_overall_mean):
+                ax_line.axhline(ds_overall_mean, color="#E84646", linewidth=0.8,
+                                linestyle="--", alpha=0.6, zorder=1)
+
+            # 均值标注：折线点正下方，边缘箱向内
+            mean_pad = (y_hi - y_lo) * 0.04
+            for xi, mv in enumerate(means):
                 if np.isnan(mv):
                     continue
-                if np.isnan(ds_overall_mean) or ds_overall_mean == 0:
-                    label_str = f"{mv:.3f}"
+                if xi >= n_bars - 2:
+                    ax_line.text(xi - 0.15, mv - mean_pad, f"{mv:.3f}",
+                                 ha="right", va="top", fontsize=4.5,
+                                 color="#CC2222", zorder=4)
                 else:
-                    label_str = f"{mv:.3f}\n×{mv / ds_overall_mean:.2f}"
-                ax.text(xi, mv + offset, label_str,
-                        ha="center", va="bottom", fontsize=5,
-                        color="#222222", zorder=4, linespacing=1.3)
+                    ax_line.text(xi + 0.15, mv - mean_pad, f"{mv:.3f}",
+                                 ha="left", va="top", fontsize=4.5,
+                                 color="#CC2222", zorder=4)
 
-            # 柱子内部标注样本占比（白色）
-            for xi, (bar, pv, mv) in enumerate(zip(bars, pcts, means)):
-                if np.isnan(mv) or bar.get_height() == 0:
-                    continue
-                bar_mid = bar.get_y() + bar.get_height() / 2
-                ax.text(xi, bar_mid, f"{pv:.1%}",
-                        ha="center", va="center", fontsize=5.5,
-                        color="white", fontweight="bold", zorder=4)
-
-            ax.set_xticks(x)
-            ax.set_xticklabels(bin_strs, rotation=45, ha="right", fontsize=6)
-            ax.set_title(f"{feature} - {ds_label}", fontsize=8, pad=4)
-            ax.tick_params(axis="y", labelsize=6)
-            ax.set_ylabel("Mean", fontsize=7)
-            ax.margins(x=0.05)
-            ax.set_ylim(y_lo, y_hi)
-            fig.tight_layout()
+            ax_bar.set_xticks(x)
+            ax_bar.set_xticklabels(bin_strs, rotation=45, ha="right", fontsize=6)
+            ax_bar.set_title(f"{feature} - {ds_label}", fontsize=8, pad=4)
+            ax_bar.margins(x=0.05)
+            fig.subplots_adjust(left=0.12, right=0.88, top=0.88, bottom=0.28)
 
             buf = io.BytesIO()
             fig.savefig(buf, format="png", dpi=110)
@@ -1425,6 +1439,76 @@ class ReportGenerator:
             fi_df = _build_feature_importance_df(feature_importance)
             if fi_df is not None:
                 fi_df.to_excel(writer, sheet_name="特征重要性", index=False)
+            # 真实值分桶 / 预测值分桶：MAPE(%)→ColorScale白→蓝，1值占比→DataBar红
+            from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
+            from openpyxl.utils import get_column_letter
+            for _sname in ["真实值分桶", "预测值分桶"]:
+                if _sname not in writer.book.sheetnames:
+                    continue
+                _ws = writer.book[_sname]
+                _header = {str(_ws.cell(row=1, column=c).value): c
+                           for c in range(1, _ws.max_column + 1)}
+                _col_mape  = _header.get("MAPE(%)")
+                _col_label = _header.get("1值占比")
+                _data_rows = []
+                for r in range(2, _ws.max_row + 1):
+                    v = str(_ws.cell(row=r, column=1).value or "")
+                    if "──" not in v and v != "None" and v != "":
+                        _data_rows.append(r)
+                if not _data_rows:
+                    continue
+                r1, r2 = _data_rows[0], _data_rows[-1]
+                if _col_mape:
+                    _cl = get_column_letter(_col_mape)
+                    _ws.conditional_formatting.add(
+                        f"{_cl}{r1}:{_cl}{r2}",
+                        ColorScaleRule(start_type="min", start_color="FFFFFFFF",
+                                       end_type="max", end_color="FF4472C4"))
+                if _col_label:
+                    _cl = get_column_letter(_col_label)
+                    _ws.conditional_formatting.add(
+                        f"{_cl}{r1}:{_cl}{r2}",
+                        DataBarRule(start_type="num", start_value=0,
+                                    end_type="max", color="FF0000"))
+            # 分桶矩阵条件格式：MAPE→DataBar红，样本数/样本占比→ColorScale白→蓝
+            if "分桶矩阵" in writer.book.sheetnames:
+                from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
+                from openpyxl.utils import get_column_letter
+                ws_mat = writer.book["分桶矩阵"]
+                max_col = ws_mat.max_column
+                # 扫描标题行，识别各块数据区域
+                i = 1
+                while i <= ws_mat.max_row:
+                    cell_val = str(ws_mat.cell(row=i, column=1).value or "")
+                    is_mape  = "MAPE矩阵" in cell_val
+                    is_n     = "样本数矩阵" in cell_val
+                    is_ratio = "样本占比矩阵" in cell_val
+                    if is_mape or is_n or is_ratio:
+                        # 下一行是列名行，再下一行开始是数据
+                        data_start = i + 2
+                        data_end   = data_start
+                        while data_end <= ws_mat.max_row:
+                            next_val = str(ws_mat.cell(row=data_end + 1, column=1).value or "")
+                            if next_val == "" or "矩阵" in next_val or "──" in next_val:
+                                break
+                            data_end += 1
+                        if data_end >= data_start:
+                            # 数据区：排除第1列（行标签）和最后一列（合计）
+                            c1 = get_column_letter(2)
+                            c2 = get_column_letter(max(2, max_col - 1))
+                            range_str = f"{c1}{data_start}:{c2}{data_end}"
+                            if is_mape:
+                                rule = DataBarRule(
+                                    start_type="num", start_value=0,
+                                    end_type="max", color="FF0000")
+                            else:
+                                rule = ColorScaleRule(
+                                    start_type="min", start_color="FFFFFFFF",
+                                    end_type="max", end_color="FF4472C4")
+                            ws_mat.conditional_formatting.add(range_str, rule)
+                        i = data_end + 1
+                    else:
+                        i += 1
             # 增益矩阵：逐块写入，每块标题行 + 列名行 + 数据行
             if gain_blocks_reg:
                 ws = writer.book.create_sheet("增益矩阵")
@@ -1688,16 +1772,28 @@ class ReportGenerator:
                 wb = writer.book
                 ws = wb.create_sheet("特征分箱图")
 
-                IMG_W = 360
-                IMG_H = 260
+                IMG_W = 480
+                IMG_H = 320
                 row_height    = int(IMG_H / 0.75 / 20) + 1  # Excel 行高单位
-                col_width_img = int(IMG_W / 7) + 1
+                col_width_img = 1                             # 每张图占1列，列宽单独设置
                 name_col      = 1
                 img_start_col = 2
+                img_col_width = IMG_W / 7.0                   # 图片宽度换算为 Excel 列宽字符数
+
+                train_df_fa = df[df[dataset_col] == "train"]
 
                 for feat_idx, feat in enumerate(features):
                     try:
-                        binned = pd.qcut(df[feat], q=5, duplicates="drop", labels=None)
+                        train_vals_fa = train_df_fa[feat].dropna()
+                        if train_vals_fa.empty:
+                            continue
+                        quantiles_fa = _np.linspace(0, 100, 6)
+                        cut_edges_fa = _np.unique(_np.percentile(train_vals_fa, quantiles_fa))
+                        if len(cut_edges_fa) < 2:
+                            continue
+                        cut_edges_fa[0]  = -_np.inf
+                        cut_edges_fa[-1] =  _np.inf
+                        binned = pd.cut(df[feat], bins=cut_edges_fa, include_lowest=True, duplicates="drop")
                     except Exception:
                         continue
 
@@ -1743,8 +1839,8 @@ class ReportGenerator:
                         continue
                     g_ymin_fa = float(_np.min(all_means_g))
                     g_ymax_fa = float(_np.max(all_means_g))
-                    g_pad_fa  = (g_ymax_fa - g_ymin_fa) * 0.2 if (g_ymax_fa - g_ymin_fa) > 0 else abs(g_ymax_fa) * 0.25 + 0.1
-                    y_lo_fa   = g_ymin_fa - g_pad_fa * 0.3
+                    g_pad_fa  = (g_ymax_fa - g_ymin_fa) * 0.35 if (g_ymax_fa - g_ymin_fa) > 0 else abs(g_ymax_fa) * 0.35 + 0.05
+                    y_lo_fa   = g_ymin_fa - g_pad_fa * 0.15
                     y_hi_fa   = g_ymax_fa + g_pad_fa
 
                     for ds_idx, ds_key in enumerate(present_datasets):
@@ -1753,52 +1849,68 @@ class ReportGenerator:
 
                         has_miss_fa = miss_n_fa > 0 and not _np.isnan(miss_mean_fa)
                         all_bin_lbls = bin_labels + (["Missing"] if has_miss_fa else [])
-                        all_means_p  = _np.append(means, miss_mean_fa if has_miss_fa else _np.nan)
-                        all_pcts_p   = _np.append(pcts,  miss_pct_fa  if has_miss_fa else _np.nan)
+                        all_means_p  = _np.append(means, miss_mean_fa) if has_miss_fa else means.copy()
+                        all_pcts_p   = _np.append(pcts,  miss_pct_fa)  if has_miss_fa else pcts.copy()
                         x = _np.arange(len(all_bin_lbls))
 
-                        fig, ax = plt.subplots(figsize=(IMG_W / 96, IMG_H / 96))
+                        fig, ax_bar = plt.subplots(figsize=(IMG_W / 96, IMG_H / 96))
+                        ax_line = ax_bar.twinx()
 
+                        # 柱子：高度 = 样本占比，左轴
                         bar_colors_fa = ["#4C72B0"] * len(means) + (["#B0784C"] if has_miss_fa else [])
-                        bars = ax.bar(x, all_means_p, color=bar_colors_fa, edgecolor="white",
-                                      alpha=0.85, zorder=2)
-                        # 折线（仅正常箱）
+                        ax_bar.bar(x, all_pcts_p, color=bar_colors_fa, edgecolor="white",
+                                   alpha=0.75, zorder=2)
+                        ax_bar.set_ylim(0, max(all_pcts_p.max() * 2.2, 0.1))
+                        ax_bar.set_ylabel("Pct", fontsize=6, color="#4C72B0")
+                        ax_bar.tick_params(axis="y", labelsize=5, colors="#4C72B0")
+
+                        # 折线：高度 = 均值，右轴，全局统一范围
                         valid = ~_np.isnan(means)
                         vx = _np.arange(len(means))
                         if valid.sum() > 1:
-                            ax.plot(vx[valid], means[valid], color="#E84646",
-                                    linewidth=1.2, marker="o", markersize=3, zorder=3)
+                            ax_line.plot(vx[valid], means[valid], color="#E84646",
+                                         linewidth=1.2, marker="o", markersize=3, zorder=3)
+                        if has_miss_fa and not _np.isnan(miss_mean_fa):
+                            ax_line.plot(len(means), miss_mean_fa,
+                                         marker="o", markersize=3, color="#B0784C", alpha=0.5, zorder=3)
+                        ax_line.set_ylim(y_lo_fa, y_hi_fa)
+                        ax_line.set_ylabel("Mean", fontsize=6, color="#E84646")
+                        ax_line.tick_params(axis="y", labelsize=5, colors="#E84646")
 
-                        # 柱顶双行标注：均值 + 伪Lift（所有箱均标注）
-                        offset = g_pad_fa * 0.12
-                        for xi, mv in zip(x, all_means_p):
+                        # 占比标注：柱顶上方，不依赖柱高
+                        pct_pad_fa = ax_bar.get_ylim()[1] * 0.02
+                        for xi, pv in enumerate(all_pcts_p):
+                            if _np.isnan(pv) or all_pcts_p[xi] == 0:
+                                continue
+                            ax_bar.text(xi, all_pcts_p[xi] + pct_pad_fa, f"{pv:.1%}",
+                                        ha="center", va="bottom", fontsize=5,
+                                        color="#333333", zorder=4)
+
+                        # 整体均值参考线（右轴坐标）
+                        if not _np.isnan(ds_overall_mean_fa):
+                            ax_line.axhline(ds_overall_mean_fa, color="#E84646", linewidth=0.8,
+                                            linestyle="--", alpha=0.6, zorder=1)
+
+                        # 均值标注：折线点正下方，边缘箱向内
+                        mean_pad_fa = (y_hi_fa - y_lo_fa) * 0.04
+                        n_bars_fa = len(all_means_p)
+                        for xi, mv in enumerate(all_means_p):
                             if _np.isnan(mv):
                                 continue
-                            if _np.isnan(ds_overall_mean_fa) or ds_overall_mean_fa == 0:
-                                label_str = f"{mv:.3f}"
+                            if xi >= n_bars_fa - 2:
+                                ax_line.text(xi - 0.15, mv - mean_pad_fa, f"{mv:.3f}",
+                                             ha="right", va="top", fontsize=4.5,
+                                             color="#CC2222", zorder=4)
                             else:
-                                label_str = f"{mv:.3f}\n×{mv / ds_overall_mean_fa:.2f}"
-                            ax.text(xi, mv + offset, label_str,
-                                    ha="center", va="bottom", fontsize=5,
-                                    color="#222222", zorder=4, linespacing=1.3)
+                                ax_line.text(xi + 0.15, mv - mean_pad_fa, f"{mv:.3f}",
+                                             ha="left", va="top", fontsize=4.5,
+                                             color="#CC2222", zorder=4)
 
-                        # 占比标注（柱内）
-                        for xi, (bar, pv, mv) in enumerate(zip(bars, all_pcts_p, all_means_p)):
-                            if _np.isnan(mv) or bar.get_height() == 0:
-                                continue
-                            bar_mid = bar.get_y() + bar.get_height() / 2
-                            ax.text(xi, bar_mid, f"{pv:.1%}",
-                                    ha="center", va="center", fontsize=5,
-                                    color="white", fontweight="bold", zorder=4)
-
-                        ax.set_xticks(x)
-                        ax.set_xticklabels(all_bin_lbls, rotation=45, ha="right", fontsize=5.5)
-                        ax.set_title(f"{feat} - {ds_label}", fontsize=7, pad=3)
-                        ax.tick_params(axis="y", labelsize=6)
-                        ax.set_ylabel("Mean", fontsize=6)
-                        ax.margins(x=0.05)
-                        ax.set_ylim(y_lo_fa, y_hi_fa)
-                        fig.tight_layout()
+                        ax_bar.set_xticks(x)
+                        ax_bar.set_xticklabels(all_bin_lbls, rotation=45, ha="right", fontsize=5.5)
+                        ax_bar.set_title(f"{feat} - {ds_label}", fontsize=7, pad=3)
+                        ax_bar.margins(x=0.05)
+                        fig.subplots_adjust(left=0.12, right=0.88, top=0.88, bottom=0.28)
 
                         buf = BytesIO()
                         fig.savefig(buf, format="png", dpi=110)
@@ -1811,6 +1923,17 @@ class ReportGenerator:
 
                         anchor_col = img_start_col + ds_idx * col_width_img
                         ws.add_image(img, ws.cell(row=anchor_row, column=anchor_col).coordinate)
+
+                # 设置列宽：特征名列窄，图片列按图宽设置
+                from openpyxl.utils import get_column_letter
+                ws.column_dimensions[get_column_letter(name_col)].width = 15
+                for ds_idx in range(len(present_datasets)):
+                    c = img_start_col + ds_idx * col_width_img
+                    ws.column_dimensions[get_column_letter(c)].width = img_col_width
+                # 设置每行行高
+                for feat_idx in range(len(features)):
+                    anchor_row = feat_idx * row_height + 1
+                    ws.row_dimensions[anchor_row].height = IMG_H / 0.75
 
         return excel_path
 
