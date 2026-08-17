@@ -5,7 +5,7 @@ saved_models/
 reports/
 reports_*/
 *.csv
-output/test_*/
+output/
 
 # Jupyter 临时文件
 .ipynb_checkpoints/
